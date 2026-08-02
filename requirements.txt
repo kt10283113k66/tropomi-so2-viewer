@@ -1,0 +1,11 @@
+streamlit>=1.40,<2
+streamlit-folium>=0.22
+folium>=0.18
+numpy>=1.26,<3
+rasterio>=1.4
+requests>=2.32
+Pillow>=10
+branca>=0.8
+xarray>=2024.10
+netCDF4>=1.7
+scipy>=1.14
