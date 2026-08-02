@@ -1162,7 +1162,13 @@ def add_peak_fitting_diagnostics(
     maximum: dict,
     emission_rate_t_day: float,
 ):
-    """モデル結果へピーク濃度比、推定放出率、流向差を追加する。"""
+    """
+    モデル結果へピーク濃度比、流向差、放出率QA判定を追加する。
+
+    放出率推定条件:
+    - TROPOMIピークカラム濃度 >= 0.0004 mol/m²
+    - TROPOMIとモデルの流向差 <= 45°
+    """
     model_peak = float(model_result["max_value"])
     tropomi_peak = float(maximum["value"])
 
@@ -1182,17 +1188,36 @@ def add_peak_fitting_diagnostics(
     direction_difference = abs(
         (tropomi_bearing - model_bearing + 180.0) % 360.0 - 180.0
     )
+    peak_ratio = tropomi_peak / model_peak
 
-    fitted_flux = (
-        float(emission_rate_t_day) * tropomi_peak / model_peak
-    )
+    qa_reasons = []
+    if tropomi_peak < 0.0004:
+        qa_reasons.append(
+            "TROPOMIピークカラム濃度が0.0004 mol/m²未満"
+        )
+    if direction_difference > 45.0:
+        qa_reasons.append(
+            "TROPOMIとモデルの流向差が45°を超過"
+        )
+
+    qa_pass = len(qa_reasons) == 0
+
+    fitted_flux = None
+    corrected_flux = None
+    if qa_pass:
+        fitted_flux = (
+            float(emission_rate_t_day) * peak_ratio
+        )
+        corrected_flux = fitted_flux * 3.0
 
     model_result["tropomi_peak_value"] = tropomi_peak
     model_result["tropomi_peak_bearing_deg"] = tropomi_bearing
     model_result["peak_direction_difference_deg"] = direction_difference
-    model_result["peak_ratio_tropomi_model"] = tropomi_peak / model_peak
+    model_result["peak_ratio_tropomi_model"] = peak_ratio
+    model_result["emission_qa_pass"] = qa_pass
+    model_result["emission_qa_reasons"] = qa_reasons
     model_result["fitted_emission_rate_t_day"] = fitted_flux
-    model_result["corrected_emission_rate_t_day"] = fitted_flux * 3.0
+    model_result["corrected_emission_rate_t_day"] = corrected_flux
     return model_result
 
 
@@ -2214,6 +2239,8 @@ else:
                     ),
                     "推定放出率": (
                         f"{result['fitted_emission_rate_t_day']:.1f} t/day"
+                        if result["fitted_emission_rate_t_day"] is not None
+                        else "QA不適合"
                     ),
                 }
             )
@@ -2327,25 +2354,43 @@ else:
             "モデルピーク",
             f"{model_result['max_value']:.6g} mol/m²",
         )
-        fit3.metric(
-            "推定放出率",
-            (
-                f"{model_result['fitted_emission_rate_t_day']:.1f} "
-                "t/day"
-            ),
-        )
-        fit4.metric(
-            "補正放出率（×3）",
-            (
-                f"{model_result['corrected_emission_rate_t_day']:.1f} "
-                "t/day"
-            ),
-        )
+        if model_result["emission_qa_pass"]:
+            fit3.metric(
+                "推定放出率",
+                (
+                    f"{model_result['fitted_emission_rate_t_day']:.1f} "
+                    "t/day"
+                ),
+            )
+            fit4.metric(
+                "補正放出率（×3）",
+                (
+                    f"{model_result['corrected_emission_rate_t_day']:.1f} "
+                    "t/day"
+                ),
+            )
+        else:
+            fit3.metric("推定放出率", "算出対象外")
+            fit4.metric("補正放出率（×3）", "算出対象外")
 
         st.write(
             "ピーク濃度比（TROPOMI／モデル）："
             f"**{model_result['peak_ratio_tropomi_model']:.3f}**"
         )
+
+        if model_result["emission_qa_pass"]:
+            st.success(
+                "放出率推定QA：PASS "
+                "（TROPOMIピーク ≥ 0.0004 mol/m²、流向差 ≤ 45°）"
+            )
+        else:
+            st.warning(
+                "放出率推定QA：FAIL\n\n"
+                + "\n\n".join(
+                    f"・{reason}"
+                    for reason in model_result["emission_qa_reasons"]
+                )
+            )
         direction1, direction2, direction3 = st.columns(3)
 
         direction1.metric(
@@ -2367,10 +2412,11 @@ else:
             ),
         )
         st.caption(
+            "TROPOMIピークカラム濃度が0.0004 mol/m²以上、かつ"
+            "TROPOMIとモデルの流向差が45°以下の場合のみ放出率を推定します。"
             "推定放出率 ＝ 入力した仮定放出率 × "
             "（TROPOMIピークカラム濃度／モデルピークカラム濃度）。"
-            "モデル濃度が放出率に比例することを利用しています。"
-            "補正放出率は、この推定放出率を3倍した値です。"
+            "補正放出率は推定放出率を3倍した値です。"
         )
         st.caption(
             "横方向拡散幅は論文式(11) "
@@ -2425,6 +2471,7 @@ with st.expander("表示・最大値・風データについて"):
 - 流向差が同じ場合は13時JSTに近い時刻を優先します。
 - さらに同値の場合は、残った候補の火口風速平均が5 m/s以上なら高い気圧面（低高度側）、5 m/s未満なら低い気圧面（高高度側）を選択します。
 - ピークフィッティング放出率は、入力放出率にTROPOMIピーク／モデルピークの比を乗じて算出します。
+- 放出率は、TROPOMIピークカラム濃度が0.0004 mol/m²以上、かつ流向差が45°以下の場合のみ算出します。
 - 補正放出率はピークフィッティング放出率の3倍として表示します。
 - TROPOMIピーク流向とモデルピーク流向は、火口から各ピーク地点への方位角（北0°、東90°、南180°、西270°）です。
 - 流向差の絶対値は、0°／360°を考慮した0～180°の最小角度差です。
