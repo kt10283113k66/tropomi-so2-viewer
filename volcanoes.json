@@ -1,0 +1,88 @@
+{
+  "volcanoes": [
+    {
+      "name": "十勝岳",
+      "crater": "108",
+      "latitude": 43.4232,
+      "longitude": 142.675
+    },
+    {
+      "name": "御嶽山",
+      "crater": "312",
+      "latitude": 35.8928,
+      "longitude": 137.48
+    },
+    {
+      "name": "阿蘇山",
+      "crater": "503",
+      "latitude": 32.8847,
+      "longitude": 131.085
+    },
+    {
+      "name": "桜島",
+      "crater": "506",
+      "latitude": 31.5769,
+      "longitude": 130.658
+    },
+    {
+      "name": "薩摩硫黄島",
+      "crater": "508",
+      "latitude": 30.7931,
+      "longitude": 130.305
+    },
+    {
+      "name": "口永良部島（新岳）",
+      "crater": "509",
+      "latitude": 30.4458,
+      "longitude": 130.215
+    },
+    {
+      "name": "口永良部島（古岳）",
+      "crater": "509.2",
+      "latitude": 30.439,
+      "longitude": 130.216
+    },
+    {
+      "name": "中之島",
+      "crater": "510",
+      "latitude": 29.8594,
+      "longitude": 129.859
+    },
+    {
+      "name": "諏訪之瀬島",
+      "crater": "511",
+      "latitude": 29.6383,
+      "longitude": 129.714
+    },
+    {
+      "name": "霧島（新燃岳）",
+      "crater": "551",
+      "latitude": 31.9094,
+      "longitude": 130.886
+    },
+    {
+      "name": "霧島（硫黄山）",
+      "crater": "552",
+      "latitude": 31.9467,
+      "longitude": 130.853
+    },
+    {
+      "name": "三宅島",
+      "crater": "320",
+      "latitude": 34.0842,
+      "longitude": 139.526
+    },
+    {
+      "name": "浅間山",
+      "crater": "306",
+      "latitude": 36.4071,
+      "longitude": 138.52
+    },
+    {
+      "name": "西ノ島",
+      "crater": "326",
+      "latitude": 27.242,
+      "longitude": 140.881
+    }
+  ]
+}

@@ -1,4 +1,5 @@
 import io
+import json
 import math
 import os
 import tempfile
@@ -28,36 +29,94 @@ PROCESS_URL = "https://sh.dataspace.copernicus.eu/api/v1/process"
 MSM_P_BASE_URL = "http://database.rish.kyoto-u.ac.jp/arch/jmadata/data/gpv/netcdf/MSM-P"
 SO2_MOLAR_MASS_KG_MOL = 0.064066
 
-VOLCANOES = {
-    "阿蘇山（中岳第一火口）": {
-        "volcano": "阿蘇山",
-        "crater": "中岳第一火口",
-        "latitude": 32.8847282,
-        "longitude": 131.0848191,
-        "zoom": 9,
-    },
-    "桜島（南岳山頂火口）": {
-        "volcano": "桜島",
-        "crater": "南岳山頂火口",
-        "latitude": 31.5769,
-        "longitude": 130.6583,
-        "zoom": 9,
-    },
-    "十勝岳(62-2火口)": {
-        "volcano": "十勝岳",
-        "crater": "62-2火口",
-        "latitude": 43.423234,
-        "longitude": 142.675452,
-        "zoom": 8,
-    },
-    "任意地点": {
-        "volcano": "任意地点",
-        "crater": "基準地点",
-        "latitude": 35.0,
-        "longitude": 135.0,
-        "zoom": 8,
-    },
-}
+VOLCANO_FILE = Path(__file__).resolve().parent / "volcanoes.json"
+
+
+@st.cache_data(show_spinner=False)
+def load_volcanoes() -> list[dict]:
+    """volcanoes.jsonから火山・火口位置を読み込む。"""
+    if not VOLCANO_FILE.exists():
+        raise RuntimeError(
+            f"火山情報ファイルが見つかりません：{VOLCANO_FILE}"
+        )
+
+    try:
+        with VOLCANO_FILE.open("r", encoding="utf-8") as file_object:
+            payload = json.load(file_object)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            f"volcanoes.jsonの形式が正しくありません：{error}"
+        ) from error
+    except OSError as error:
+        raise RuntimeError(
+            f"volcanoes.jsonを読み込めません：{error}"
+        ) from error
+
+    volcanoes = payload.get("volcanoes")
+    if not isinstance(volcanoes, list) or not volcanoes:
+        raise RuntimeError(
+            "volcanoes.jsonのvolcanoesは、1件以上の配列にしてください。"
+        )
+
+    required = {"name", "crater", "latitude", "longitude"}
+    cleaned = []
+
+    for index, item in enumerate(volcanoes, start=1):
+        if not isinstance(item, dict):
+            raise RuntimeError(
+                f"volcanoes.jsonの{index}件目がオブジェクトではありません。"
+            )
+
+        missing = required - set(item)
+        if missing:
+            raise RuntimeError(
+                f"volcanoes.jsonの{index}件目に不足項目があります："
+                + ", ".join(sorted(missing))
+            )
+
+        name = str(item["name"]).strip()
+        crater = str(item["crater"]).strip()
+
+        try:
+            latitude = float(item["latitude"])
+            longitude = float(item["longitude"])
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                f"volcanoes.jsonの{index}件目の緯度経度が数値ではありません。"
+            ) from error
+
+        if not name:
+            raise RuntimeError(
+                f"volcanoes.jsonの{index}件目のnameが空です。"
+            )
+        if not crater:
+            raise RuntimeError(
+                f"volcanoes.jsonの{index}件目のcraterが空です。"
+            )
+        if not (-90.0 <= latitude <= 90.0):
+            raise RuntimeError(
+                f"{name}の緯度が範囲外です：{latitude}"
+            )
+        if not (-180.0 <= longitude <= 180.0):
+            raise RuntimeError(
+                f"{name}の経度が範囲外です：{longitude}"
+            )
+
+        cleaned.append(
+            {
+                "name": name,
+                "crater": crater,
+                "latitude": latitude,
+                "longitude": longitude,
+            }
+        )
+
+    return cleaned
+
+
+def volcano_display_name(volcano: dict) -> str:
+    return f"{volcano['name']}（{volcano['crater']}）"
+
 
 # 指定された固定階級
 SO2_BOUNDS = [
@@ -1509,14 +1568,24 @@ require_app_password()
 st.title("TROPOMI SO₂ 表示ビューア")
 st.caption("TROPOMI SO₂ + 京都大学生存圏研究所 MSM-P / 準定常ガス拡散モデル")
 
+try:
+    volcanoes = load_volcanoes()
+except RuntimeError as error:
+    st.error(str(error))
+    st.stop()
+
 with st.sidebar:
     st.header("表示設定")
 
-    volcano_name = st.selectbox(
-        "火山を選択",
-        list(VOLCANOES),
+    selected_volcano_index = st.selectbox(
+        "火山・火口を選択",
+        options=range(len(volcanoes)),
+        format_func=lambda index: volcano_display_name(
+            volcanoes[index]
+        ),
     )
-    preset = VOLCANOES[volcano_name]
+    preset = volcanoes[selected_volcano_index]
+    volcano_name = volcano_display_name(preset)
 
     selected_date = st.date_input(
         "観測日（日本時間）",
@@ -1546,24 +1615,13 @@ with st.sidebar:
         format_func=lambda value: f"{value} × {value}",
     )
 
-    if volcano_name == "任意地点":
-        crater_lat = st.number_input(
-            "基準地点の緯度",
-            min_value=-90.0,
-            max_value=90.0,
-            value=float(preset["latitude"]),
-            format="%.5f",
-        )
-        crater_lon = st.number_input(
-            "基準地点の経度",
-            min_value=-180.0,
-            max_value=180.0,
-            value=float(preset["longitude"]),
-            format="%.5f",
-        )
-    else:
-        crater_lat = float(preset["latitude"])
-        crater_lon = float(preset["longitude"])
+    crater_lat = float(preset["latitude"])
+    crater_lon = float(preset["longitude"])
+
+    st.caption(
+        f"火口情報：{preset['name']} / {preset['crater']}\n\n"
+        f"緯度 {crater_lat:.4f}°、経度 {crater_lon:.4f}°"
+    )
 
     st.subheader("レイヤー設定")
 
@@ -1960,7 +2018,7 @@ if run:
             "crater_lat": crater_lat,
             "crater_lon": crater_lon,
             "volcano_name": volcano_name,
-            "zoom": int(preset["zoom"]),
+            "zoom": 8,
         }
 
     except requests.Timeout:
