@@ -25,7 +25,7 @@ TOKEN_URL = (
     "auth/realms/CDSE/protocol/openid-connect/token"
 )
 PROCESS_URL = "https://sh.dataspace.copernicus.eu/api/v1/process"
-MSM_P_BASE_URL = "https://database.rish.kyoto-u.ac.jp/arch/jmadata/data/gpv/netcdf/MSM-P"
+MSM_P_BASE_URL = "http://database.rish.kyoto-u.ac.jp/arch/jmadata/data/gpv/netcdf/MSM-P"
 SO2_MOLAR_MASS_KG_MOL = 0.064066
 
 VOLCANOES = {
