@@ -1361,6 +1361,64 @@ def add_peak_fitting_diagnostics(
     return model_result
 
 
+
+def add_manual_fitting_diagnostics(
+    model_result: dict,
+    selected_tropomi: dict,
+    emission_rate_t_day: float,
+):
+    """
+    手動選択したTROPOMI地点・濃度を用いてフィッティングする。
+
+    手動計算では0.001 mol/m²未満や流向差45°超過でも参考値を算出し、
+    QA判定は警告情報として保持する。
+    """
+    model_peak = float(model_result["max_value"])
+    selected_value = float(selected_tropomi["value"])
+
+    if not np.isfinite(model_peak) or model_peak <= 0.0:
+        raise RuntimeError(
+            "モデルピークカラム濃度が0以下のため、"
+            "手動フィッティングを実行できません。"
+        )
+    if not np.isfinite(selected_value) or selected_value <= 0.0:
+        raise RuntimeError(
+            "手動指定するTROPOMIカラム濃度は0より大きくしてください。"
+        )
+
+    tropomi_bearing = float(selected_tropomi["bearing_deg"])
+    model_bearing = float(model_result["max_bearing_deg"])
+    direction_difference = abs(
+        (tropomi_bearing - model_bearing + 180.0) % 360.0 - 180.0
+    )
+
+    peak_ratio = selected_value / model_peak
+    fitted_flux = float(emission_rate_t_day) * peak_ratio
+    corrected_flux = fitted_flux * 3.0
+
+    qa_reasons = []
+    if selected_value < PLUME_THRESHOLD_MOL_M2:
+        qa_reasons.append(
+            "手動指定濃度が0.001 mol/m²未満"
+        )
+    if direction_difference > MAX_DIRECTION_DIFFERENCE_DEG:
+        qa_reasons.append(
+            "手動選択地点とモデルの流向差が45°を超過"
+        )
+
+    model_result["tropomi_peak_value"] = selected_value
+    model_result["tropomi_peak_bearing_deg"] = tropomi_bearing
+    model_result["peak_direction_difference_deg"] = direction_difference
+    model_result["peak_ratio_tropomi_model"] = peak_ratio
+    model_result["emission_qa_pass"] = len(qa_reasons) == 0
+    model_result["emission_qa_reasons"] = qa_reasons
+    model_result["fitted_emission_rate_t_day"] = fitted_flux
+    model_result["corrected_emission_rate_t_day"] = corrected_flux
+    model_result["manual_fitting"] = True
+    return model_result
+
+
+
 def choose_optimal_candidate(candidates: list[dict]):
     """指定ルールに従って最適候補を選択する。"""
     if not candidates:
@@ -1997,6 +2055,17 @@ with st.sidebar:
         format_func=lambda value: f"{value} × {value}",
     )
 
+    use_connected_plume_detection = st.checkbox(
+        "連結数でプルーム判定する",
+        value=False,
+        help=(
+            "OFF：10～30 km内の判定格子で0.001 mol/m²以上の"
+            "ピークがあれば採用します。"
+            "ON：閾値以上の画素が8近傍で3個以上連結する場合だけ"
+            "プルームとして採用します。"
+        ),
+    )
+
     crater_lat = float(preset["latitude"])
     crater_lon = float(preset["longitude"])
 
@@ -2273,6 +2342,12 @@ if run:
             if cloud_array.shape != so2_array.shape:
                 raise RuntimeError("SO₂と雲量の格子形状が一致しません。")
 
+            minimum_connected_pixels = (
+                MIN_CONNECTED_PLUME_PIXELS
+                if use_connected_plume_detection
+                else 1
+            )
+
             maximum = find_annulus_maximum(
                 array=plume_detection_array,
                 transform=plume_detection_transform,
@@ -2281,7 +2356,7 @@ if run:
                 min_distance_km=10.0,
                 max_distance_km=30.0,
                 threshold_mol_m2=PLUME_THRESHOLD_MOL_M2,
-                min_connected_pixels=MIN_CONNECTED_PLUME_PIXELS,
+                min_connected_pixels=minimum_connected_pixels,
             )
             if maximum is not None:
                 maximum["detection_grid_width"] = int(detection_width)
@@ -2318,11 +2393,17 @@ if run:
             if not run_model_calculation:
                 model_error = None
             elif maximum is None:
-                model_error = (
-                    "10～30 km内で、0.001 mol/m²以上の画素が"
-                    "3画素以上連結するプルームを検出できないため、"
-                    "モデル計算を実行しませんでした。"
-                )
+                if use_connected_plume_detection:
+                    model_error = (
+                        "10～30 km内で、0.001 mol/m²以上の画素が"
+                        "8近傍で3画素以上連結するプルームを"
+                        "検出できないため、モデル計算を実行しませんでした。"
+                    )
+                else:
+                    model_error = (
+                        "10～30 km内に0.001 mol/m²以上のSO₂ピークを"
+                        "検出できないため、モデル計算を実行しませんでした。"
+                    )
             else:
                 for jst_hour in sorted(selected_jst_hours):
                     # 選択日JSTからUTC日時へ変換する。
@@ -2453,6 +2534,9 @@ if run:
             "model_result": model_result,
             "model_error": model_error,
             "run_model_calculation": run_model_calculation,
+            "use_connected_plume_detection": (
+                use_connected_plume_detection
+            ),
             "msm_field": msm_field,
             "model_candidates": model_candidates,
             "model_candidate_errors": model_candidate_errors,
@@ -2468,6 +2552,12 @@ if run:
             ),
             "emission_height_m": emission_height_m,
             "emission_rate_t_day": emission_rate_t_day,
+            "maximum_axis_km": maximum_axis_km,
+            "lateral_half_width_km": lateral_half_width_km,
+            "model_grid_size": model_grid_size,
+            "model_resolution_ns_km": float(model_resolution_ns_km),
+            "model_resolution_ew_km": float(model_resolution_ew_km),
+            "manual_fitting_result": None,
             "bbox": bbox,
             "selected_date": selected_date,
             "crater_lat": crater_lat,
@@ -2571,10 +2661,17 @@ else:
         maximum = data["maximum"]
 
         if maximum is None:
-            st.warning(
-                "10～30 km内で、0.001 mol/m²以上の画素が"
-                "3画素以上連結するプルームを検出できませんでした。"
-            )
+            if data.get("use_connected_plume_detection", False):
+                st.warning(
+                    "10～30 km内で、0.001 mol/m²以上の画素が"
+                    "8近傍で3画素以上連結するプルームを"
+                    "検出できませんでした。"
+                )
+            else:
+                st.warning(
+                    "10～30 km内に0.001 mol/m²以上の"
+                    "SO₂ピークを検出できませんでした。"
+                )
         else:
             st.metric(
                 "SO₂カラム濃度",
@@ -2593,23 +2690,369 @@ else:
             st.write(
                 f"経度：{maximum['longitude']:.5f}°"
             )
-            st.write(
-                "連結ピクセル数："
-                f"**{maximum['connected_pixel_count']}**"
-            )
-            st.write(
-                "連結判定格子："
-                f"**{maximum.get('detection_grid_width', '?')} × "
-                f"{maximum.get('detection_grid_height', '?')}** "
-                "（約7 km東西 × 3.5 km南北）"
-            )
-            st.caption(
-                "約3.5 km×7 kmのTROPOMI相当格子で、0.001 mol/m²以上の"
-                "画素が3画素以上、8近傍で連結した成分内の最大値です。"
-                "地図上の黄色い★が最大値の位置です。"
-            )
+            if data.get("use_connected_plume_detection", False):
+                st.write(
+                    "連結ピクセル数："
+                    f"**{maximum['connected_pixel_count']}**"
+                )
+                st.write(
+                    "連結判定格子："
+                    f"**{maximum.get('detection_grid_width', '?')} × "
+                    f"{maximum.get('detection_grid_height', '?')}** "
+                    "（約7 km東西 × 3.5 km南北）"
+                )
+                st.caption(
+                    "約3.5 km×7 kmのTROPOMI相当格子で、"
+                    "0.001 mol/m²以上の画素が3画素以上、"
+                    "8近傍で連結した成分内の最大値です。"
+                    "地図上の黄色い★が最大値の位置です。"
+                )
+            else:
+                st.caption(
+                    "連結数判定はOFFです。約3.5 km×7 kmの判定格子で、"
+                    "10～30 km内の0.001 mol/m²以上の画素から"
+                    "最大値を採用しています。"
+                    "地図上の黄色い★が最大値の位置です。"
+                )
 
     st.divider()
+
+    st.subheader("任意地点の追加フィッティング")
+    st.caption(
+        "自動計算後に地図上のTROPOMI画素をクリックし、"
+        "その地点と任意のカラム濃度を使ってモデルを再計算します。"
+        "自動計算結果は上書きされません。"
+    )
+
+    clicked_for_manual = map_result.get("last_clicked")
+    manual_click_value = None
+    manual_click_lat = None
+    manual_click_lon = None
+    manual_click_distance = None
+    manual_click_bearing = None
+
+    if clicked_for_manual:
+        manual_click_lat = float(clicked_for_manual["lat"])
+        manual_click_lon = float(clicked_for_manual["lng"])
+        manual_click_value = value_at_click(
+            data["array"],
+            data["transform"],
+            manual_click_lat,
+            manual_click_lon,
+        )
+        manual_click_distance = float(
+            haversine_km(
+                data["crater_lat"],
+                data["crater_lon"],
+                manual_click_lat,
+                manual_click_lon,
+            )
+        )
+        manual_click_bearing = float(
+            bearing_deg(
+                data["crater_lat"],
+                data["crater_lon"],
+                manual_click_lat,
+                manual_click_lon,
+            )
+        )
+
+    manual_candidates_source = data.get("model_candidates", [])
+    manual_ready = (
+        bool(manual_candidates_source)
+        and manual_click_value is not None
+        and manual_click_distance is not None
+        and manual_click_distance > 0.0
+    )
+
+    manual_col1, manual_col2 = st.columns(2)
+
+    with manual_col1:
+        if clicked_for_manual:
+            st.write(
+                f"選択地点：緯度 {manual_click_lat:.5f}° / "
+                f"経度 {manual_click_lon:.5f}°"
+            )
+            st.write(
+                f"火口からの距離：{manual_click_distance:.2f} km"
+            )
+            st.write(
+                f"火口からの方位：{manual_click_bearing:.1f}°"
+            )
+        else:
+            st.info(
+                "先に地図上でフィッティング対象の画素をクリックしてください。"
+            )
+
+    with manual_col2:
+        default_manual_value = (
+            float(manual_click_value)
+            if manual_click_value is not None
+            and np.isfinite(manual_click_value)
+            and manual_click_value > 0.0
+            else 0.001
+        )
+        manual_tropomi_value = st.number_input(
+            "手動指定TROPOMIカラム濃度（mol/m²）",
+            min_value=0.000001,
+            max_value=1.0,
+            value=default_manual_value,
+            step=0.0001,
+            format="%.6f",
+            key="manual_tropomi_value",
+            help=(
+                "クリック地点の値を初期値として表示します。"
+                "必要に応じて任意の正の値へ変更できます。"
+            ),
+        )
+
+    manual_button = st.button(
+        "選択した濃度で追加フィッティングを実行",
+        type="secondary",
+        use_container_width=True,
+        disabled=not manual_ready,
+    )
+
+    if manual_button:
+        manual_target = {
+            "value": float(manual_tropomi_value),
+            "latitude": float(manual_click_lat),
+            "longitude": float(manual_click_lon),
+            "distance_km": float(manual_click_distance),
+            "bearing_deg": float(manual_click_bearing),
+        }
+
+        manual_candidates = []
+        manual_errors = []
+
+        with st.spinner(
+            "選択地点の流下距離に合わせてモデルを再計算しています…"
+        ):
+            for original_candidate in manual_candidates_source:
+                try:
+                    candidate_field = original_candidate["msm_field"]
+
+                    candidate_result = calculate_quasi_steady_model(
+                        msm_field=candidate_field,
+                        crater_latitude=data["crater_lat"],
+                        crater_longitude=data["crater_lon"],
+                        bbox=data["bbox"],
+                        output_size=int(data["model_grid_size"]),
+                        emission_rate_t_day=float(
+                            data["emission_rate_t_day"]
+                        ),
+                        maximum_distance_km=float(
+                            data["maximum_axis_km"]
+                        ),
+                        lateral_half_width_km=float(
+                            data["lateral_half_width_km"]
+                        ),
+                        tropomi_peak_distance_km=float(
+                            manual_target["distance_km"]
+                        ),
+                        peak_distance_half_width_km=5.0,
+                        target_ns_km=float(
+                            data["model_resolution_ns_km"]
+                        ),
+                        target_ew_km=float(
+                            data["model_resolution_ew_km"]
+                        ),
+                    )
+
+                    candidate_result = add_manual_fitting_diagnostics(
+                        candidate_result,
+                        manual_target,
+                        float(data["emission_rate_t_day"]),
+                    )
+
+                    manual_candidates.append(
+                        {
+                            "requested_jst_hour": original_candidate.get(
+                                "requested_jst_hour",
+                                original_candidate["jst_hour"],
+                            ),
+                            "jst_hour": int(
+                                original_candidate["jst_hour"]
+                            ),
+                            "utc_hour": int(
+                                original_candidate.get(
+                                    "utc_hour",
+                                    candidate_field["utc_hour"],
+                                )
+                            ),
+                            "pressure_level": int(
+                                original_candidate["pressure_level"]
+                            ),
+                            "model_result": candidate_result,
+                            "msm_field": candidate_field,
+                            "emission_height_m": original_candidate.get(
+                                "emission_height_m"
+                            ),
+                        }
+                    )
+                except Exception as error:
+                    manual_errors.append(
+                        {
+                            "jst_hour": original_candidate.get(
+                                "jst_hour"
+                            ),
+                            "pressure_level": original_candidate.get(
+                                "pressure_level"
+                            ),
+                            "error": str(error),
+                        }
+                    )
+
+        if manual_candidates:
+            manual_optimal, manual_reason = choose_optimal_candidate(
+                manual_candidates
+            )
+            data["manual_fitting_result"] = {
+                "target": manual_target,
+                "candidates": manual_candidates,
+                "candidate_errors": manual_errors,
+                "optimal_candidate": manual_optimal,
+                "selection_reason": manual_reason,
+            }
+            st.session_state["viewer"] = data
+            st.success("追加フィッティングが完了しました。")
+            st.rerun()
+        else:
+            st.error(
+                "選択した地点について、すべてのモデル候補の再計算に"
+                "失敗しました。"
+            )
+            if manual_errors:
+                st.dataframe(
+                    manual_errors,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+    manual_fitting_result = data.get("manual_fitting_result")
+    if manual_fitting_result:
+        manual_target = manual_fitting_result["target"]
+        manual_optimal = manual_fitting_result["optimal_candidate"]
+        manual_model = manual_optimal["model_result"]
+
+        st.markdown("#### 追加フィッティング結果")
+
+        mt1, mt2, mt3, mt4 = st.columns(4)
+        mt1.metric(
+            "手動指定TROPOMI濃度",
+            f"{manual_target['value']:.6g} mol/m²",
+        )
+        mt2.metric(
+            "選択地点の流下距離",
+            f"{manual_target['distance_km']:.2f} km",
+        )
+        mt3.metric(
+            "採用モデル",
+            (
+                f"{manual_optimal['jst_hour']:02d}:00 JST / "
+                f"{manual_optimal['pressure_level']} hPa"
+            ),
+        )
+        mt4.metric(
+            "流向差",
+            f"{manual_model['peak_direction_difference_deg']:.1f}°",
+        )
+
+        mf1, mf2, mf3 = st.columns(3)
+        mf1.metric(
+            "モデルピーク濃度",
+            f"{manual_model['max_value']:.6g} mol/m²",
+        )
+        mf2.metric(
+            "推定放出率",
+            (
+                f"{manual_model['fitted_emission_rate_t_day']:.1f} "
+                "t/day"
+            ),
+        )
+        mf3.metric(
+            "補正放出率（×3）",
+            (
+                f"{manual_model['corrected_emission_rate_t_day']:.1f} "
+                "t/day"
+            ),
+        )
+
+        if manual_model["emission_qa_pass"]:
+            st.success(
+                "手動フィッティングQA：PASS "
+                "（指定濃度 ≥ 0.001 mol/m²、流向差 ≤ 45°）"
+            )
+        else:
+            st.warning(
+                "手動フィッティングは参考値として算出しました。"
+                "\n\n"
+                + "\n\n".join(
+                    f"・{reason}"
+                    for reason in manual_model[
+                        "emission_qa_reasons"
+                    ]
+                )
+            )
+
+        with st.expander("手動フィッティング候補の比較"):
+            manual_rows = []
+            for candidate in sorted(
+                manual_fitting_result["candidates"],
+                key=lambda item: (
+                    item["jst_hour"],
+                    -item["pressure_level"],
+                ),
+            ):
+                candidate_model = candidate["model_result"]
+                manual_rows.append(
+                    {
+                        "最適": (
+                            "○"
+                            if (
+                                candidate["jst_hour"]
+                                == manual_optimal["jst_hour"]
+                                and candidate["pressure_level"]
+                                == manual_optimal["pressure_level"]
+                            )
+                            else ""
+                        ),
+                        "時刻（JST）": (
+                            f"{candidate['jst_hour']:02d}:00"
+                        ),
+                        "気圧面": (
+                            f"{candidate['pressure_level']} hPa"
+                        ),
+                        "モデルピーク": (
+                            f"{candidate_model['max_value']:.6g}"
+                        ),
+                        "流向差": (
+                            f"{candidate_model['peak_direction_difference_deg']:.3f}°"
+                        ),
+                        "推定放出率": (
+                            f"{candidate_model['fitted_emission_rate_t_day']:.1f}"
+                        ),
+                        "補正放出率": (
+                            f"{candidate_model['corrected_emission_rate_t_day']:.1f}"
+                        ),
+                    }
+                )
+            st.dataframe(
+                manual_rows,
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.caption(
+                manual_fitting_result["selection_reason"]
+            )
+
+        if st.button(
+            "追加フィッティング結果をクリア",
+            use_container_width=True,
+        ):
+            data["manual_fitting_result"] = None
+            st.session_state["viewer"] = data
+            st.rerun()
 
     st.divider()
     st.subheader("準定常ガス拡散モデル")
@@ -2925,6 +3368,8 @@ with st.expander("表示・最大値・風データについて"):
 - 流向差が同じ場合は13時JSTに近い時刻を優先します。
 - さらに同値の場合は、残った候補の火口風速平均が5 m/s以上なら高い気圧面（低高度側）、5 m/s未満なら低い気圧面（高高度側）を選択します。
 - ピークフィッティング放出率は、入力放出率にTROPOMIピーク／モデルピークの比を乗じて算出します。
+- 自動計算後は、地図で選択した任意地点と任意のカラム濃度を使い、同じ風候補で追加フィッティングできます。
+- 手動追加フィッティングは自動結果を上書きせず、別枠の参考値として表示します。
 - 補正放出率はピークフィッティング放出率の3倍として表示します。
 - TROPOMIピーク流向とモデルピーク流向は、火口から各ピーク地点への方位角（北0°、東90°、南180°、西270°）です。
 - 流向差の絶対値は、0°／360°を考慮した0～180°の最小角度差です。
