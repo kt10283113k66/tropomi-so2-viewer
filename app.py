@@ -2792,17 +2792,54 @@ else:
             and manual_click_value > 0.0
             else 0.001
         )
+
+        # 選択ピクセルが変わった場合だけ、入力欄を新しいクリック値へ更新する。
+        # 同じピクセルのままの場合は、利用者が手入力した値を維持する。
+        current_click_signature = None
+        if (
+            manual_click_lat is not None
+            and manual_click_lon is not None
+        ):
+            current_click_signature = (
+                round(float(manual_click_lat), 6),
+                round(float(manual_click_lon), 6),
+            )
+
+        previous_click_signature = st.session_state.get(
+            "manual_tropomi_click_signature"
+        )
+
+        if (
+            current_click_signature is not None
+            and current_click_signature
+            != previous_click_signature
+        ):
+            st.session_state["manual_tropomi_value"] = (
+                default_manual_value
+            )
+            st.session_state[
+                "manual_tropomi_click_signature"
+            ] = current_click_signature
+            # 新しいピクセルを選択した時点で、前回の手動結果はクリアする。
+            data["manual_fitting_result"] = None
+            st.session_state["viewer"] = data
+
+        elif "manual_tropomi_value" not in st.session_state:
+            st.session_state["manual_tropomi_value"] = (
+                default_manual_value
+            )
+
         manual_tropomi_value = st.number_input(
             "手動指定TROPOMIカラム濃度（mol/m²）",
             min_value=0.000001,
             max_value=1.0,
-            value=default_manual_value,
             step=0.0001,
             format="%.6f",
             key="manual_tropomi_value",
             help=(
-                "クリック地点の値を初期値として表示します。"
-                "必要に応じて任意の正の値へ変更できます。"
+                "選択ピクセルが変わると、その地点のカラム濃度へ"
+                "自動更新されます。同じピクセルのままでは、"
+                "手入力した値を維持します。"
             ),
         )
 
