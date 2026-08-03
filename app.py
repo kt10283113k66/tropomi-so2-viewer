@@ -1997,7 +1997,7 @@ with st.sidebar:
 
     selected_pressure_levels = st.multiselect(
         "MSM-P気圧面",
-        options=[900, 850, 800],
+        options=[1000, 950, 900, 850, 800, 700, 500],
         default=[900, 850, 800],
         format_func=lambda value: f"{value} hPa",
         disabled=not run_model_calculation,
