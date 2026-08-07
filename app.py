@@ -2017,15 +2017,58 @@ except RuntimeError as error:
 with st.sidebar:
     st.header("表示設定")
 
+    volcano_options = list(range(len(volcanoes))) + ["manual"]
+
     selected_volcano_index = st.selectbox(
         "火山・火口を選択",
-        options=range(len(volcanoes)),
-        format_func=lambda index: volcano_display_name(
-            volcanoes[index]
+        options=volcano_options,
+        index=0,
+        format_func=lambda option: (
+            "任意地点（緯度・経度を手動入力）"
+            if option == "manual"
+            else volcano_display_name(volcanoes[option])
         ),
     )
-    preset = volcanoes[selected_volcano_index]
-    volcano_name = volcano_display_name(preset)
+
+    if selected_volcano_index == "manual":
+        st.markdown("##### 任意地点の座標")
+        manual_loc1, manual_loc2 = st.columns(2)
+        with manual_loc1:
+            crater_lat = st.number_input(
+                "緯度（°）",
+                min_value=-90.0,
+                max_value=90.0,
+                value=35.0000,
+                step=0.0001,
+                format="%.4f",
+                key="manual_crater_latitude",
+            )
+        with manual_loc2:
+            crater_lon = st.number_input(
+                "経度（°）",
+                min_value=-180.0,
+                max_value=180.0,
+                value=135.0000,
+                step=0.0001,
+                format="%.4f",
+                key="manual_crater_longitude",
+            )
+
+        preset = {
+            "name": "任意地点",
+            "crater": "手動入力",
+            "latitude": float(crater_lat),
+            "longitude": float(crater_lon),
+        }
+        volcano_name = (
+            f"任意地点（{float(crater_lat):.4f}, "
+            f"{float(crater_lon):.4f}）"
+        )
+    else:
+        preset = volcanoes[selected_volcano_index]
+        crater_lat = float(preset["latitude"])
+        crater_lon = float(preset["longitude"])
+        volcano_name = volcano_display_name(preset)
 
     selected_date = st.date_input(
         "観測日（日本時間）",
@@ -2066,13 +2109,19 @@ with st.sidebar:
         ),
     )
 
-    crater_lat = float(preset["latitude"])
-    crater_lon = float(preset["longitude"])
+    crater_lat = float(crater_lat)
+    crater_lon = float(crater_lon)
 
-    st.caption(
-        f"火口情報：{preset['name']} / {preset['crater']}\n\n"
-        f"緯度 {crater_lat:.4f}°、経度 {crater_lon:.4f}°"
-    )
+    if selected_volcano_index == "manual":
+        st.caption(
+            "解析中心：任意地点\n\n"
+            f"緯度 {crater_lat:.4f}°、経度 {crater_lon:.4f}°"
+        )
+    else:
+        st.caption(
+            f"火口情報：{preset['name']} / {preset['crater']}\n\n"
+            f"緯度 {crater_lat:.4f}°、経度 {crater_lon:.4f}°"
+        )
 
     st.subheader("レイヤー設定")
 
@@ -2387,24 +2436,16 @@ if run:
             msm_field = None
             emission_height_m = float(manual_emission_height_m)
             model_candidates = []
+            msm_candidates = []
             model_candidate_errors = []
             optimal_selection_reason = None
 
             if not run_model_calculation:
                 model_error = None
-            elif maximum is None:
-                if use_connected_plume_detection:
-                    model_error = (
-                        "10～30 km内で、0.001 mol/m²以上の画素が"
-                        "8近傍で3画素以上連結するプルームを"
-                        "検出できないため、モデル計算を実行しませんでした。"
-                    )
-                else:
-                    model_error = (
-                        "10～30 km内に0.001 mol/m²以上のSO₂ピークを"
-                        "検出できないため、モデル計算を実行しませんでした。"
-                    )
             else:
+                # 自動ピークの有無にかかわらずMSM-P風場は取得する。
+                # これにより、自動検出失敗時でも後から任意地点で
+                # 手動フィッティングできる。
                 for jst_hour in sorted(selected_jst_hours):
                     # 選択日JSTからUTC日時へ変換する。
                     jst_datetime = datetime.combine(
@@ -2445,51 +2486,58 @@ if run:
                                     ]
                                 )
 
-                            candidate_result = calculate_quasi_steady_model(
-                                msm_field=candidate_field,
-                                crater_latitude=crater_lat,
-                                crater_longitude=crater_lon,
-                                bbox=bbox,
-                                output_size=model_grid_size,
-                                emission_rate_t_day=emission_rate_t_day,
-                                maximum_distance_km=maximum_axis_km,
-                                lateral_half_width_km=(
-                                    lateral_half_width_km
-                                ),
-                                tropomi_peak_distance_km=(
-                                    maximum["distance_km"]
-                                ),
-                                peak_distance_half_width_km=5.0,
-                                target_ns_km=float(model_resolution_ns_km),
-                                target_ew_km=float(model_resolution_ew_km),
-                            )
-                            candidate_result = add_peak_fitting_diagnostics(
-                                candidate_result,
-                                maximum,
-                                emission_rate_t_day,
-                            )
-
                             actual_jst_hour = (
                                 int(candidate_field["utc_hour"]) + 9
                             ) % 24
 
-                            model_candidates.append(
-                                {
-                                    "requested_jst_hour": int(jst_hour),
-                                    "jst_hour": int(actual_jst_hour),
-                                    "utc_hour": int(
-                                        candidate_field["utc_hour"]
+                            field_candidate = {
+                                "requested_jst_hour": int(jst_hour),
+                                "jst_hour": int(actual_jst_hour),
+                                "utc_hour": int(
+                                    candidate_field["utc_hour"]
+                                ),
+                                "pressure_level": int(
+                                    pressure_level
+                                ),
+                                "msm_field": candidate_field,
+                                "emission_height_m": (
+                                    candidate_emission_height_m
+                                ),
+                            }
+                            msm_candidates.append(field_candidate)
+
+                            # 自動ピークが存在する場合だけ、自動モデル計算を行う。
+                            if maximum is not None:
+                                candidate_result = calculate_quasi_steady_model(
+                                    msm_field=candidate_field,
+                                    crater_latitude=crater_lat,
+                                    crater_longitude=crater_lon,
+                                    bbox=bbox,
+                                    output_size=model_grid_size,
+                                    emission_rate_t_day=emission_rate_t_day,
+                                    maximum_distance_km=maximum_axis_km,
+                                    lateral_half_width_km=(
+                                        lateral_half_width_km
                                     ),
-                                    "pressure_level": int(
-                                        pressure_level
+                                    tropomi_peak_distance_km=(
+                                        maximum["distance_km"]
                                     ),
-                                    "model_result": candidate_result,
-                                    "msm_field": candidate_field,
-                                    "emission_height_m": (
-                                        candidate_emission_height_m
-                                    ),
-                                }
-                            )
+                                    peak_distance_half_width_km=5.0,
+                                    target_ns_km=float(model_resolution_ns_km),
+                                    target_ew_km=float(model_resolution_ew_km),
+                                )
+                                candidate_result = add_peak_fitting_diagnostics(
+                                    candidate_result,
+                                    maximum,
+                                    emission_rate_t_day,
+                                )
+
+                                model_candidates.append(
+                                    {
+                                        **field_candidate,
+                                        "model_result": candidate_result,
+                                    }
+                                )
                         except Exception as error:
                             model_candidate_errors.append(
                                 {
@@ -2501,7 +2549,20 @@ if run:
                                 }
                             )
 
-                if model_candidates:
+                if maximum is None:
+                    if msm_candidates:
+                        model_error = (
+                            "自動ピークは検出できませんでした。"
+                            "ただしMSM-P風場は取得済みのため、"
+                            "地図上で任意地点を選択して"
+                            "追加フィッティングを実行できます。"
+                        )
+                    else:
+                        model_error = (
+                            "自動ピークを検出できず、さらに選択した全パターンで"
+                            "MSM-P風場の取得にも失敗しました。"
+                        )
+                elif model_candidates:
                     optimal_candidate, optimal_selection_reason = (
                         choose_optimal_candidate(model_candidates)
                     )
@@ -2539,6 +2600,7 @@ if run:
             ),
             "msm_field": msm_field,
             "model_candidates": model_candidates,
+            "msm_candidates": msm_candidates,
             "model_candidate_errors": model_candidate_errors,
             "tropomi_resolution": tropomi_resolution,
             "optimal_selection_reason": optimal_selection_reason,
@@ -2719,8 +2781,11 @@ else:
 
     st.subheader("任意地点の追加フィッティング")
     st.caption(
-        "自動計算後に地図上のTROPOMI画素をクリックし、"
+        "地図上の任意のTROPOMI画素をクリックし、"
         "その地点と任意のカラム濃度を使ってモデルを再計算します。"
+        "手動フィッティングでは、0.001 mol/m²以上・10～30 km・"
+        "連結数などの自動検出条件は適用しません。"
+        "自動ピークを検出できなかった場合でも実行できます。"
         "自動計算結果は上書きされません。"
     )
 
@@ -2757,10 +2822,17 @@ else:
             )
         )
 
-    manual_candidates_source = data.get("model_candidates", [])
+    # 自動ピークが無い場合でも、取得済みMSM-P風場から
+    # 手動フィッティングできる。
+    manual_candidates_source = data.get("msm_candidates", [])
+    if not manual_candidates_source:
+        manual_candidates_source = data.get("model_candidates", [])
+
     manual_ready = (
-        bool(manual_candidates_source)
+        data.get("run_model_calculation", True)
+        and bool(manual_candidates_source)
         and manual_click_value is not None
+        and np.isfinite(manual_click_value)
         and manual_click_distance is not None
         and manual_click_distance > 0.0
     )
@@ -2840,6 +2912,7 @@ else:
                 "選択ピクセルが変わると、その地点のカラム濃度へ"
                 "自動更新されます。同じピクセルのままでは、"
                 "手入力した値を維持します。"
+                "手動フィッティングでは0.001 mol/m²未満でも使用できます。"
             ),
         )
 
@@ -3017,12 +3090,14 @@ else:
 
         if manual_model["emission_qa_pass"]:
             st.success(
-                "手動フィッティングQA：PASS "
+                "参考QA：PASS "
                 "（指定濃度 ≥ 0.001 mol/m²、流向差 ≤ 45°）"
             )
         else:
             st.warning(
-                "手動フィッティングは参考値として算出しました。"
+                "手動フィッティングでは自動検出条件を制約として"
+                "適用していないため、以下に該当していても"
+                "放出率を参考値として算出しています。"
                 "\n\n"
                 + "\n\n".join(
                     f"・{reason}"
@@ -3405,7 +3480,9 @@ with st.expander("表示・最大値・風データについて"):
 - 流向差が同じ場合は13時JSTに近い時刻を優先します。
 - さらに同値の場合は、残った候補の火口風速平均が5 m/s以上なら高い気圧面（低高度側）、5 m/s未満なら低い気圧面（高高度側）を選択します。
 - ピークフィッティング放出率は、入力放出率にTROPOMIピーク／モデルピークの比を乗じて算出します。
-- 自動計算後は、地図で選択した任意地点と任意のカラム濃度を使い、同じ風候補で追加フィッティングできます。
+- 地図で選択した任意地点と任意のカラム濃度を使い、取得済みのMSM-P風候補で追加フィッティングできます。
+- 自動ピークを検出できない場合でも、MSM-P風場の取得に成功していれば手動追加フィッティングを実行できます。
+- 手動追加フィッティングでは、0.001 mol/m²以上、10～30 km、連結ピクセル数などの自動ピーク検出条件を適用しません。
 - 手動追加フィッティングは自動結果を上書きせず、別枠の参考値として表示します。
 - 補正放出率はピークフィッティング放出率の3倍として表示します。
 - TROPOMIピーク流向とモデルピーク流向は、火口から各ピーク地点への方位角（北0°、東90°、南180°、西270°）です。
