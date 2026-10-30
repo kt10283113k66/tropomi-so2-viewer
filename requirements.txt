@@ -8,5 +8,5 @@ scipy
 branca
 Pillow
 streamlit-folium
+cfgrib
 eccodes
-eccodeslib
