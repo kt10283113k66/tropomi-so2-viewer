@@ -831,47 +831,62 @@ def download_msm_grib(cycle: datetime) -> bytes:
 
 def _read_grib_component(path: Path, short_name: str, step: int,
                          pressure_level: int):
-    """cfgribで必要な予報時間・気圧面だけを取り出す。"""
+    """ecCodesでGRIBメッセージを直接選択する（cfgribの座標結合に依存しない）。"""
     try:
-        import cfgrib
+        import eccodes as ec
     except ImportError as error:
         raise RuntimeError(
-            "GRIB2の読み込みにはcfgribとeccodesが必要です。"
-            "requirements.txtにcfgribとeccodesを追加してください。"
+            "GRIB2読み込みにはeccodesが必要です。requirements_msm_grib2.txtを確認してください。"
         ) from error
-    # 変数ごとにフィルタすることで、複数の鉛直座標やstepを含むGRIBを処理する。
-    filters = {"typeOfLevel": "isobaricInhPa", "shortName": short_name}
-    try:
-        ds = xr.open_dataset(str(path), engine="cfgrib",
-            backend_kwargs={"filter_by_keys": filters, "indexpath": ""})
-    except Exception as error:
-        raise RuntimeError(f"GRIB2 {short_name}の読み込みに失敗：{error}") from error
-    try:
-        if short_name not in ds:
-            raise RuntimeError(f"GRIB2に{short_name}がありません。")
-        arr = ds[short_name]
-        if "step" in arr.dims:
-            steps = np.asarray(ds["step"].values).astype("timedelta64[h]").astype(int)
-            indices = np.flatnonzero(steps == step)
-            if not len(indices):
-                raise RuntimeError(f"FH{step}がGRIB2に含まれていません。")
-            arr = arr.isel(step=int(indices[0]))
-        elif "step" in ds.coords:
-            actual_step = int(np.asarray(ds["step"].values).astype("timedelta64[h]").astype(int))
-            if actual_step != step:
-                raise RuntimeError(f"FH{step}がGRIB2に含まれていません。")
-        if "isobaricInhPa" not in arr.coords:
-            raise RuntimeError("GRIB2に気圧面座標がありません。")
-        levels = np.atleast_1d(arr["isobaricInhPa"].values).astype(float)
-        if not np.any(np.isclose(levels, pressure_level)):
-            raise RuntimeError(f"{pressure_level}hPaがGRIB2にありません。")
-        if "isobaricInhPa" in arr.dims:
-            arr = arr.sel(isobaricInhPa=float(pressure_level))
-        return np.asarray(arr.values, dtype=float), (
-            np.asarray(arr["latitude"].values, dtype=float),
-            np.asarray(arr["longitude"].values, dtype=float))
-    finally:
-        ds.close()
+
+    available = set()
+    with path.open("rb") as fh:
+        while True:
+            gid = ec.codes_grib_new_from_file(fh)
+            if gid is None:
+                break
+            try:
+                try:
+                    name = str(ec.codes_get(gid, "shortName"))
+                    level_type = str(ec.codes_get(gid, "typeOfLevel"))
+                    level = float(ec.codes_get(gid, "level"))
+                    # forecastTimeはGRIB2の時間単位に依存するため、stepUnitsを時間に正規化。
+                    step_hours = float(ec.codes_get(gid, "endStep", ktype=float))
+                    step_units = str(ec.codes_get(gid, "stepUnits"))
+                    if step_units in ("m", "min"):
+                        step_hours /= 60.0
+                    elif step_units in ("s", "sec"):
+                        step_hours /= 3600.0
+                    elif step_units in ("d", "day"):
+                        step_hours *= 24.0
+                except Exception:
+                    continue
+                if name != short_name or level_type not in ("isobaricInhPa", "isobaricInPa"):
+                    continue
+                level_hpa = level / 100.0 if level_type == "isobaricInPa" else level
+                if abs(level_hpa - pressure_level) > 0.01:
+                    continue
+                available.add(round(step_hours, 4))
+                if abs(step_hours - step) > 1e-6:
+                    continue
+                values = np.asarray(ec.codes_get_array(gid, "values"), dtype=float)
+                lats = np.asarray(ec.codes_get_array(gid, "latitudes"), dtype=float)
+                lons = np.asarray(ec.codes_get_array(gid, "longitudes"), dtype=float)
+                try:
+                    nj = int(ec.codes_get(gid, "Nj"))
+                    ni = int(ec.codes_get(gid, "Ni"))
+                except Exception:
+                    nj = int(ec.codes_get(gid, "Ny"))
+                    ni = int(ec.codes_get(gid, "Nx"))
+                if values.size != ni * nj:
+                    raise RuntimeError("GRIB2の格子点数と値の数が一致しません。")
+                return values.reshape(nj, ni), (lats.reshape(nj, ni), lons.reshape(nj, ni))
+            finally:
+                ec.codes_release(gid)
+    raise RuntimeError(
+        f"{pressure_level} hPaの{short_name}でFH{step}が見つかりません。"
+        f"このファイルに含まれる予報時間：{sorted(available)}"
+    )
 
 
 @st.cache_data(show_spinner=False, ttl=86400, max_entries=80)
@@ -879,19 +894,35 @@ def fetch_msm_p_field(target_date: date, utc_hour: int, pressure_level: int,
                       crater_latitude: float, crater_longitude: float):
     """MSM気圧面GRIB2から指定した有効時刻の2次元風速場を取得。"""
     valid_utc = datetime.combine(target_date, time(hour=int(utc_hour)))
-    cycle, step = msm_cycle_and_step(valid_utc)
-    raw = download_msm_grib(cycle)
-    with tempfile.TemporaryDirectory() as tmpdir:
-        path = Path(tmpdir) / "msm.grib2"
-        path.write_bytes(raw)
-        u, (lats, lons) = _read_grib_component(path, "u", step, pressure_level)
-        v, _ = _read_grib_component(path, "v", step, pressure_level)
-        height = None
+    # 最新の初期時刻を優先。FHが欠けている場合は前の初期時刻から
+    # 同一の有効時刻を探す（時刻をずらして代用することはしない）。
+    latest_cycle, _ = msm_cycle_and_step(valid_utc)
+    errors = []
+    for cycle_offset in range(4):
+        cycle = latest_cycle - timedelta(hours=3 * cycle_offset)
+        step = int((valid_utc - cycle).total_seconds() // 3600)
+        if step > 15:
+            continue
         try:
-            gh, _ = _read_grib_component(path, "gh", step, pressure_level)
-            height = gh
-        except (RuntimeError, ValueError):
-            pass
+            raw = download_msm_grib(cycle)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                path = Path(tmpdir) / "msm.grib2"
+                path.write_bytes(raw)
+                u, (lats, lons) = _read_grib_component(path, "u", step, pressure_level)
+                v, _ = _read_grib_component(path, "v", step, pressure_level)
+                height = None
+                try:
+                    height, _ = _read_grib_component(path, "gh", step, pressure_level)
+                except RuntimeError:
+                    pass
+            break
+        except (RuntimeError, OSError, ValueError) as error:
+            errors.append(f"{cycle:%Y-%m-%d %H}UTC FH{step}: {error}")
+    else:
+        raise RuntimeError(
+            f"{valid_utc:%Y-%m-%d %H}UTC・{pressure_level}hPaの風速場が取得できません。\n"
+            + "\n".join(errors)
+        )
     if lats.ndim == 1 and lons.ndim == 1:
         lon_grid, lat_grid = np.meshgrid(lons, lats)
     else:
