@@ -904,37 +904,48 @@ def _read_grib_component(path: Path, short_name: str, step: int,
 @st.cache_data(show_spinner=False, ttl=86400, max_entries=80)
 def fetch_msm_p_field(target_date: date, utc_hour: int, pressure_level: int,
                       crater_latitude: float, crater_longitude: float):
-    """MSM気圧面GRIB2から指定した有効時刻の2次元風速場を取得。"""
+    """MSM-Pの3時間間隔の場を取得し、間の正時は時間線形内挿する。
+
+    RISHのL-pall_FH00-15ファイルに含まれるFHは0,3,6,9,12,15。
+    FH1/FH2は存在しないため、存在しないFHを探索し続けない。
+    """
     valid_utc = datetime.combine(target_date, time(hour=int(utc_hour)))
-    # 最新の初期時刻を優先。FHが欠けている場合は前の初期時刻から
-    # 同一の有効時刻を探す（時刻をずらして代用することはしない）。
-    latest_cycle, _ = msm_cycle_and_step(valid_utc)
-    errors = []
-    for cycle_offset in range(4):
-        cycle = latest_cycle - timedelta(hours=3 * cycle_offset)
-        step = int((valid_utc - cycle).total_seconds() // 3600)
-        if step > 15:
-            continue
-        try:
-            raw = download_msm_grib(cycle)
-            with tempfile.TemporaryDirectory() as tmpdir:
-                path = Path(tmpdir) / "msm.grib2"
-                path.write_bytes(raw)
-                u, (lats, lons) = _read_grib_component(path, "u", step, pressure_level)
-                v, _ = _read_grib_component(path, "v", step, pressure_level)
-                height = None
+    cycle, step = msm_cycle_and_step(valid_utc)
+    # cycle は直前の3時間毎の初期時刻。FH0とFH3は同一ファイル内。
+    raw = download_msm_grib(cycle)
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "msm.grib2"
+            path.write_bytes(raw)
+            def read_at(fh):
+                u, (lats, lons) = _read_grib_component(path, "u", fh, pressure_level)
+                v, _ = _read_grib_component(path, "v", fh, pressure_level)
                 try:
-                    height, _ = _read_grib_component(path, "gh", step, pressure_level)
+                    height, _ = _read_grib_component(path, "gh", fh, pressure_level)
                 except RuntimeError:
-                    pass
-            break
-        except (RuntimeError, OSError, ValueError) as error:
-            errors.append(f"{cycle:%Y-%m-%d %H}UTC FH{step}: {error}")
-    else:
+                    height = None
+                return u, v, height, lats, lons
+            u0, v0, h0, lats, lons = read_at(0)
+            if step == 0:
+                u, v, height = u0, v0, h0
+            else:
+                u3, v3, h3, lats3, lons3 = read_at(3)
+                if (u0.shape != u3.shape or v0.shape != v3.shape
+                        or lats.shape != lats3.shape or lons.shape != lons3.shape
+                        or not np.allclose(lats, lats3)
+                        or not np.allclose(lons, lons3)):
+                    raise RuntimeError("MSM-PのFH0とFH3の格子が一致しません。")
+                weight = step / 3.0
+                u = (1 - weight) * u0 + weight * u3
+                v = (1 - weight) * v0 + weight * v3
+                height = ((1 - weight) * h0 + weight * h3
+                          if h0 is not None and h3 is not None else None)
+    except (RuntimeError, OSError, ValueError) as error:
         raise RuntimeError(
-            f"{valid_utc:%Y-%m-%d %H}UTC・{pressure_level}hPaの風速場が取得できません。\n"
-            + "\n".join(errors)
-        )
+            f"{valid_utc:%Y-%m-%d %H}UTC・{pressure_level}hPaの風速場取得に失敗。"
+            f"初期時刻{cycle:%Y-%m-%d %H}UTC、FH0/FH3：{error}"
+        ) from error
+
     if lats.ndim == 1 and lons.ndim == 1:
         lon_grid, lat_grid = np.meshgrid(lons, lats)
     else:
@@ -974,6 +985,8 @@ def fetch_msm_p_field(target_date: date, utc_hour: int, pressure_level: int,
             "source_url": msm_grib_url(cycle),
             "forecast_cycle_utc": cycle.strftime("%Y-%m-%d %H:%M UTC"),
             "forecast_hour": step,
+            "temporal_interpolation": ("linear_FH0_FH3" if step else "none"),
+            "source_forecast_hours": ([0, 3] if step else [0]),
             "geopotential_height_m": geopotential_height}
 
 
@@ -2117,6 +2130,7 @@ st.set_page_config(
 require_app_password()
 st.title("TROPOMI SO₂ 表示ビューア")
 st.caption("TROPOMI SO₂ + 京都大学生存圏研究所 MSM-P / 準定常ガス拡散モデル")
+st.caption("注：RISHのMSM-P気圧面GRIB2は3時間間隔（FH0, 3, 6…）です。毎正時の風は、その前後の3時間値から線形内挿して作成します。")
 
 try:
     volcanoes = load_volcanoes()
