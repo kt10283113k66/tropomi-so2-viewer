@@ -839,6 +839,18 @@ def _read_grib_component(path: Path, short_name: str, step: int,
             "GRIB2読み込みにはeccodesが必要です。requirements_msm_grib2.txtを確認してください。"
         ) from error
 
+    # JMA MSM-Pは1つのGRIB2メッセージ内に多数の場を格納する
+    # multi-field GRIB2形式。ecCodesはデフォルトでは先頭の場しか
+    # 返さないため、必ずmulti-field supportを有効化する。
+    # 無効のままだと先頭の高度場だけが見え、u/vのFH一覧が[]になる。
+    try:
+        ec.codes_grib_multi_support_on()
+    except AttributeError as error:
+        raise RuntimeError(
+            "使用中のeccodesがmulti-field GRIB2の読み込みに対応していません。"
+            "eccodesを更新してください。"
+        ) from error
+
     available = set()
     with path.open("rb") as fh:
         while True:
