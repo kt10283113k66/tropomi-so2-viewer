@@ -3,6 +3,7 @@ import json
 import math
 import os
 import tempfile
+from bisect import bisect_right
 from pathlib import Path
 from datetime import date, datetime, time, timedelta, timezone
 
@@ -27,7 +28,9 @@ TOKEN_URL = (
     "auth/realms/CDSE/protocol/openid-connect/token"
 )
 PROCESS_URL = "https://sh.dataspace.copernicus.eu/api/v1/process"
-MSM_P_BASE_URL = "http://database.rish.kyoto-u.ac.jp/arch/jmadata/data/gpv/netcdf/MSM-P"
+MSM_P_BASE_URL = "https://database.rish.kyoto-u.ac.jp/arch/jmadata/data/gpv/original"
+MODEL_LOOKBACK_HOURS = 5
+MODEL_TIME_STEP_MINUTES = 5
 SO2_MOLAR_MASS_KG_MOL = 0.064066
 PLUME_THRESHOLD_MOL_M2 = 0.001
 MIN_CONNECTED_PLUME_PIXELS = 3
@@ -793,162 +796,172 @@ def xy_to_latlon(x_m, y_m, origin_latitude, origin_longitude):
     return latitude, longitude
 
 
-@st.cache_data(show_spinner=False, ttl=86400)
-def fetch_msm_p_field(
-    target_date: date,
-    utc_hour: int,
-    pressure_level: int,
-    crater_latitude: float,
-    crater_longitude: float,
-):
-    """MSM-P日別NetCDFから指定時刻・気圧面の2次元風場を取得する。"""
-    year = f"{target_date.year:04d}"
-    filename = f"{target_date.month:02d}{target_date.day:02d}.nc"
-    url = f"{MSM_P_BASE_URL}/{year}/{filename}"
-    headers = {"User-Agent": "TROPOMI-SO2-Viewer/1.0"}
+def msm_cycle_and_step(valid_utc: datetime) -> tuple[datetime, int]:
+    """有効時刻に対応する直近の3時間毎の初期時刻と予報時間。"""
+    cycle = valid_utc.replace(hour=(valid_utc.hour // 3) * 3, minute=0, second=0, microsecond=0)
+    return cycle, int((valid_utc - cycle).total_seconds() // 3600)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        target = Path(tmpdir) / filename
 
-        try:
-            with requests.get(
-                url,
-                headers=headers,
-                stream=True,
-                timeout=(30, 300),
-            ) as response:
-                if response.status_code == 404:
-                    raise RuntimeError(
-                        f"MSM-Pデータが見つかりません（{target_date.isoformat()}）。"
-                        "公開前または欠測の可能性があります。"
-                    )
-                response.raise_for_status()
-                with target.open("wb") as file_object:
-                    for chunk in response.iter_content(chunk_size=1024 * 1024):
-                        if chunk:
-                            file_object.write(chunk)
-        except requests.Timeout as error:
-            raise RuntimeError("MSM-Pデータの取得がタイムアウトしました。") from error
-        except requests.RequestException as error:
-            raise RuntimeError(f"MSM-Pデータの取得に失敗しました：{error}") from error
-
-        requested_time = np.datetime64(
-            datetime.combine(target_date, time(hour=int(utc_hour)))
-        )
-
-        try:
-            with xr.open_dataset(target) as ds:
-                for coordinate in ("time", "p", "lat", "lon"):
-                    if coordinate not in ds.coords:
-                        raise RuntimeError(
-                            f"MSM-Pファイルに座標 {coordinate} がありません。"
-                        )
-                if "u" not in ds.data_vars or "v" not in ds.data_vars:
-                    raise RuntimeError("MSM-Pファイルにuまたはvが含まれていません。")
-
-                available_levels = np.asarray(ds["p"].values, dtype=float)
-                if not np.any(np.isclose(available_levels, pressure_level)):
-                    raise RuntimeError(
-                        f"{pressure_level} hPaはMSM-Pに収録されていません。"
-                    )
-
-                selected = ds.sel(
-                    time=requested_time,
-                    p=float(pressure_level),
-                    method="nearest",
-                )
-
-                # 主軸50 km＋補間半径10 kmを十分含むよう火口周辺を切り出す。
-                # MSM-Pのlat座標はファイルによって昇順・降順が異なるため、
-                # sliceではなく条件式で抽出する。
-                lat_min = crater_latitude - 1.2
-                lat_max = crater_latitude + 1.2
-                lon_min = crater_longitude - 1.5
-                lon_max = crater_longitude + 1.5
-
-                selected = selected.where(
-                    (selected["lat"] >= lat_min)
-                    & (selected["lat"] <= lat_max),
-                    drop=True,
-                )
-                selected = selected.where(
-                    (selected["lon"] >= lon_min)
-                    & (selected["lon"] <= lon_max),
-                    drop=True,
-                )
-
-                if selected.sizes.get("lat", 0) == 0:
-                    raise RuntimeError(
-                        "火口周辺のMSM-P緯度格子を抽出できませんでした。"
-                    )
-                if selected.sizes.get("lon", 0) == 0:
-                    raise RuntimeError(
-                        "火口周辺のMSM-P経度格子を抽出できませんでした。"
-                    )
-
-                latitudes = np.asarray(selected["lat"].values, dtype=float)
-                longitudes = np.asarray(selected["lon"].values, dtype=float)
-                u = np.asarray(selected["u"].values, dtype=float).squeeze()
-                v = np.asarray(selected["v"].values, dtype=float).squeeze()
-
-                if u.ndim != 2 or v.ndim != 2:
-                    raise RuntimeError("MSM-Pのu・vが2次元格子として読み込めません。")
-
-                actual_time = np.asarray(selected["time"]).astype("datetime64[s]").item()
-
-                geopotential_height = None
-                for candidate in ("z", "gh", "geopotential_height"):
-                    if candidate in selected.data_vars:
-                        z_data = selected[candidate]
-                        if (
-                            z_data.sizes.get("lat", 0) > 0
-                            and z_data.sizes.get("lon", 0) > 0
-                        ):
-                            z_point = z_data.sel(
-                                lat=crater_latitude,
-                                lon=crater_longitude,
-                                method="nearest",
-                            )
-                            geopotential_height = float(
-                                np.asarray(z_point).squeeze()
-                            )
-                        break
-        except (OSError, ValueError) as error:
-            raise RuntimeError(
-                f"MSM-P NetCDFの読み込みに失敗しました：{error}"
-            ) from error
-
-    lon_grid, lat_grid = np.meshgrid(longitudes, latitudes)
-    x_grid, y_grid = local_xy_m(
-        lat_grid,
-        lon_grid,
-        crater_latitude,
-        crater_longitude,
+def msm_grib_url(cycle: datetime) -> str:
+    filename = (
+        f"Z__C_RJTD_{cycle:%Y%m%d%H}0000_MSM_GPV_Rjp_L-pall_"
+        "FH00-15_grib2.bin"
     )
+    return f"{MSM_P_BASE_URL}/{cycle:%Y/%m/%d}/{filename}"
 
+
+@st.cache_data(show_spinner=False, ttl=86400, max_entries=16)
+def download_msm_grib(cycle: datetime) -> bytes:
+    """GRIB2を自動取得。Streamlitキャッシュにより同じ初期値は再取得しない。"""
+    url = msm_grib_url(cycle)
+    try:
+        with requests.get(url, stream=True, timeout=(30, 300),
+                          headers={"User-Agent": "TROPOMI-SO2-Viewer/2.0"}) as response:
+            if response.status_code == 404:
+                raise RuntimeError(f"MSM気圧面GRIB2が見つかりません：{url}")
+            response.raise_for_status()
+            buffer = io.BytesIO()
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    buffer.write(chunk)
+            return buffer.getvalue()
+    except requests.RequestException as error:
+        raise RuntimeError(f"MSM GRIB2取得エラー（{url}）：{error}") from error
+
+
+def _read_grib_component(path: Path, short_name: str, step: int,
+                         pressure_level: int):
+    """cfgribで必要な予報時間・気圧面だけを取り出す。"""
+    try:
+        import cfgrib
+    except ImportError as error:
+        raise RuntimeError(
+            "GRIB2の読み込みにはcfgribとeccodesが必要です。"
+            "requirements.txtにcfgribとeccodesを追加してください。"
+        ) from error
+    # 変数ごとにフィルタすることで、複数の鉛直座標やstepを含むGRIBを処理する。
+    filters = {"typeOfLevel": "isobaricInhPa", "shortName": short_name}
+    try:
+        ds = xr.open_dataset(str(path), engine="cfgrib",
+            backend_kwargs={"filter_by_keys": filters, "indexpath": ""})
+    except Exception as error:
+        raise RuntimeError(f"GRIB2 {short_name}の読み込みに失敗：{error}") from error
+    try:
+        if short_name not in ds:
+            raise RuntimeError(f"GRIB2に{short_name}がありません。")
+        arr = ds[short_name]
+        if "step" in arr.dims:
+            steps = np.asarray(ds["step"].values).astype("timedelta64[h]").astype(int)
+            indices = np.flatnonzero(steps == step)
+            if not len(indices):
+                raise RuntimeError(f"FH{step}がGRIB2に含まれていません。")
+            arr = arr.isel(step=int(indices[0]))
+        elif "step" in ds.coords:
+            actual_step = int(np.asarray(ds["step"].values).astype("timedelta64[h]").astype(int))
+            if actual_step != step:
+                raise RuntimeError(f"FH{step}がGRIB2に含まれていません。")
+        if "isobaricInhPa" not in arr.coords:
+            raise RuntimeError("GRIB2に気圧面座標がありません。")
+        levels = np.atleast_1d(arr["isobaricInhPa"].values).astype(float)
+        if not np.any(np.isclose(levels, pressure_level)):
+            raise RuntimeError(f"{pressure_level}hPaがGRIB2にありません。")
+        if "isobaricInhPa" in arr.dims:
+            arr = arr.sel(isobaricInhPa=float(pressure_level))
+        return np.asarray(arr.values, dtype=float), (
+            np.asarray(arr["latitude"].values, dtype=float),
+            np.asarray(arr["longitude"].values, dtype=float))
+    finally:
+        ds.close()
+
+
+@st.cache_data(show_spinner=False, ttl=86400, max_entries=80)
+def fetch_msm_p_field(target_date: date, utc_hour: int, pressure_level: int,
+                      crater_latitude: float, crater_longitude: float):
+    """MSM気圧面GRIB2から指定した有効時刻の2次元風速場を取得。"""
+    valid_utc = datetime.combine(target_date, time(hour=int(utc_hour)))
+    cycle, step = msm_cycle_and_step(valid_utc)
+    raw = download_msm_grib(cycle)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "msm.grib2"
+        path.write_bytes(raw)
+        u, (lats, lons) = _read_grib_component(path, "u", step, pressure_level)
+        v, _ = _read_grib_component(path, "v", step, pressure_level)
+        height = None
+        try:
+            gh, _ = _read_grib_component(path, "gh", step, pressure_level)
+            height = gh
+        except (RuntimeError, ValueError):
+            pass
+    if lats.ndim == 1 and lons.ndim == 1:
+        lon_grid, lat_grid = np.meshgrid(lons, lats)
+    else:
+        lat_grid, lon_grid = lats, lons
+    if u.shape != lat_grid.shape or v.shape != lat_grid.shape:
+        raise RuntimeError("GRIB2の風速成分と緯度経度格子の形状が一致しません。")
+    region = ((lat_grid >= crater_latitude - 1.2) &
+              (lat_grid <= crater_latitude + 1.2) &
+              (lon_grid >= crater_longitude - 1.5) &
+              (lon_grid <= crater_longitude + 1.5))
+    if not np.any(region):
+        raise RuntimeError("火口周辺にMSMの格子点がありません。")
+    rows, cols = np.where(region)
+    r0, r1 = rows.min(), rows.max() + 1
+    c0, c1 = cols.min(), cols.max() + 1
+    lat_grid = lat_grid[r0:r1, c0:c1]
+    lon_grid = lon_grid[r0:r1, c0:c1]
+    u = u[r0:r1, c0:c1]
+    v = v[r0:r1, c0:c1]
+    x_grid, y_grid = local_xy_m(lat_grid, lon_grid, crater_latitude, crater_longitude)
     valid = np.isfinite(u) & np.isfinite(v)
     if not np.any(valid):
-        raise RuntimeError("MSM-Pの風データが欠測です。")
+        raise RuntimeError("MSMの風速データが欠測しています。")
+    geopotential_height = None
+    if height is not None:
+        height_crop = height[r0:r1, c0:c1]
+        closest = np.argmin(np.where(np.isfinite(height_crop),
+                    x_grid**2 + y_grid**2, np.inf))
+        value = float(height_crop.ravel()[closest])
+        if np.isfinite(value):
+            geopotential_height = value
+    return {"lat_grid": lat_grid, "lon_grid": lon_grid,
+            "x_grid_m": x_grid, "y_grid_m": y_grid,
+            "u_ms": u, "v_ms": v, "valid": valid,
+            "analysis_time": valid_utc.strftime("%Y-%m-%d %H:%M UTC"),
+            "utc_hour": valid_utc.hour, "pressure_level": int(pressure_level),
+            "source_url": msm_grib_url(cycle),
+            "forecast_cycle_utc": cycle.strftime("%Y-%m-%d %H:%M UTC"),
+            "forecast_hour": step,
+            "geopotential_height_m": geopotential_height}
 
-    if isinstance(actual_time, datetime):
-        actual_datetime = actual_time
-    else:
-        actual_datetime = datetime.fromisoformat(str(actual_time))
 
-    return {
-        "lat_grid": lat_grid,
-        "lon_grid": lon_grid,
-        "x_grid_m": x_grid,
-        "y_grid_m": y_grid,
-        "u_ms": u,
-        "v_ms": v,
-        "valid": valid,
-        "analysis_time": actual_datetime.strftime("%Y-%m-%d %H:%M UTC"),
-        "utc_hour": int(actual_datetime.hour),
-        "pressure_level": int(pressure_level),
-        "source_url": url,
-        "geopotential_height_m": geopotential_height,
-    }
+def build_time_varying_msm_field(end_utc: datetime, pressure_level: int,
+                                  crater_latitude: float, crater_longitude: float):
+    """各正時の風を前後30分に適用。計算期間に必要な風速場を収集する。"""
+    start_utc = end_utc - timedelta(hours=MODEL_LOOKBACK_HOURS)
+    first_valid = start_utc.replace(minute=0, second=0, microsecond=0)
+    fields = []
+    for hour_offset in range(MODEL_LOOKBACK_HOURS + 1):
+        valid_time = first_valid + timedelta(hours=hour_offset)
+        field = fetch_msm_p_field(valid_time.date(), valid_time.hour,
+                    pressure_level, crater_latitude, crater_longitude)
+        fields.append({"valid_time": valid_time, "field": field})
+    # 終了時刻の風を代表値とし、既存の表示項目・手動フィッティングとの互換性を維持。
+    result = dict(fields[-1]["field"])
+    result["time_slices"] = fields
+    result["model_start_utc"] = start_utc
+    result["model_end_utc"] = end_utc
+    result["wind_application"] = "毎正時の風を前後30分に適用"
+    return result
+
+
+def wind_field_at(msm_field: dict, instant: datetime):
+    """各正時の前後30分に風速場を割り当てる。"""
+    slices = msm_field.get("time_slices")
+    if not slices:
+        return msm_field
+    midpoints = [item["valid_time"] + timedelta(minutes=30) for item in slices]
+    index = bisect_right(midpoints, instant)
+    return slices[min(index, len(slices) - 1)]["field"]
 
 
 def interpolate_idw_wind(msm_field, x_m: float, y_m: float, radius_m: float = 10_000.0):
@@ -977,12 +990,66 @@ def interpolate_idw_wind(msm_field, x_m: float, y_m: float, radius_m: float = 10
     return u, v
 
 
+def calculate_time_varying_axis(msm_field, maximum_distance_km: float):
+    """各放出時刻の気塊を終了時刻まで追跡し、時変風速場のプルーム主軸を生成。"""
+    start = msm_field["model_start_utc"]
+    end = msm_field["model_end_utc"]
+    dt = timedelta(minutes=MODEL_TIME_STEP_MINUTES)
+    release_times = []
+    t = end - dt
+    while t >= start:
+        release_times.append(t)
+        t -= dt
+    xs, ys, distances, speeds = [0.0], [0.0], [0.0], []
+    u0, v0 = interpolate_idw_wind(wind_field_at(msm_field, end), 0.0, 0.0)
+    speed0 = math.hypot(u0, v0)
+    if speed0 < 0.2:
+        raise RuntimeError("終了時刻の火口上空風速が小さすぎます。")
+    speeds.append(speed0)
+    for released in release_times:
+        x = y = travelled = 0.0
+        current = released
+        while current < end:
+            mid = current + dt / 2
+            field = wind_field_at(msm_field, mid)
+            u, v = interpolate_idw_wind(field, x, y)
+            seconds = min((end - current).total_seconds(), dt.total_seconds())
+            x += u * seconds
+            y += v * seconds
+            travelled += math.hypot(u, v) * seconds
+            current += timedelta(seconds=seconds)
+        if travelled > maximum_distance_km * 1000.0:
+            continue
+        xs.append(x)
+        ys.append(y)
+        distances.append(travelled)
+        final_u, final_v = interpolate_idw_wind(wind_field_at(msm_field, end), x, y)
+        speeds.append(max(math.hypot(final_u, final_v), 0.1))
+    if len(xs) < 3:
+        raise RuntimeError("時間変化する風速場から十分な主軸を計算できません。")
+    # 距離順に並べ、KDTree・ピーク探索との既存インターフェースを維持。
+    order = np.argsort(distances)
+    xs = np.asarray(xs)[order]
+    ys = np.asarray(ys)[order]
+    distances = np.asarray(distances)[order]
+    speeds = np.asarray(speeds)[order]
+    wind_from = (270.0 - math.degrees(math.atan2(v0, u0))) % 360.0
+    return {"x_m": xs, "y_m": ys, "distance_m": distances,
+            "speed_ms": speeds, "delta_t_s": dt.total_seconds(),
+            "crater_u_ms": float(u0), "crater_v_ms": float(v0),
+            "crater_speed_ms": float(speed0),
+            "crater_wind_from_deg": wind_from,
+            "crater_transport_to_deg": (wind_from + 180.0) % 360.0}
+
+
 def calculate_main_axis(
     msm_field,
     maximum_distance_km: float,
     nominal_step_m: float = 100.0,
 ):
     """式(1)～(7)に基づき、MSM-P固定時刻の風場から主軸を計算する。"""
+    if msm_field.get("time_slices"):
+        return calculate_time_varying_axis(msm_field, maximum_distance_km)
     u0, v0 = interpolate_idw_wind(msm_field, 0.0, 0.0)
     speed0 = math.hypot(u0, v0)
     if speed0 < 0.2:
@@ -2187,12 +2254,12 @@ with st.sidebar:
 
     selected_jst_hours = st.multiselect(
         "計算時刻（JST）",
-        options=list(range(0, 24, 3)),
-        default=[12, 15],
+        options=[13, 14],
+        default=[13, 14],
         format_func=lambda value: f"{value:02d}:00 JST",
         help=(
             "選択した時刻と気圧面の全組合せを計算します。"
-            "MSM-Pは3時間間隔です。"
+            "各正時の風を前後30分間に適用し、終了時刻まで過去5時間を計算します。"
         ),
         disabled=not run_model_calculation,
     )
@@ -2461,12 +2528,9 @@ if run:
                         reverse=True,
                     ):
                         try:
-                            candidate_field = fetch_msm_p_field(
-                                msm_date_utc,
-                                msm_hour_utc,
-                                pressure_level,
-                                crater_lat,
-                                crater_lon,
+                            candidate_field = build_time_varying_msm_field(
+                                utc_datetime, pressure_level,
+                                crater_lat, crater_lon,
                             )
 
                             candidate_emission_height_m = float(
@@ -3470,7 +3534,7 @@ with st.expander("表示・最大値・風データについて"):
 - 表示値はSentinel Hubで地図格子へ再サンプリングされた値です。
 - TROPOMI Level-2 NetCDFの元ピクセル値と完全に同一ではありません。
 - 準定常モデルの横方向拡散幅は論文式(11)の大気不安定条件を使用します。
-- MSM-Pは3時間間隔のため、選択時刻に最も近い解析時刻の風場を固定して計算します。
+- MSMのGRIB2予報値を使用し、終了時刻から過去5時間の風速場を毎時30分に切り替えます。
 - モデルカラム濃度は式(8)の鉛直解析積分値です。
 - モデルは高解像度で内部計算した後、約3.5 km×7 kmのTROPOMI相当格子へ面積平均して表示します。
 - 放出率は1 t = 1,000 kgとして、t/day → kg/s → mol/sの順に変換します。
