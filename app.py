@@ -810,48 +810,61 @@ def msm_grib_url(cycle: datetime) -> str:
     return f"{MSM_P_BASE_URL}/{cycle:%Y/%m/%d}/{filename}"
 
 
-@st.cache_data(show_spinner=False, ttl=86400, max_entries=16)
-def download_msm_grib(cycle: datetime) -> bytes:
-    """GRIB2を自動取得。Streamlitキャッシュにより同じ初期値は再取得しない。"""
+# GRIB2は約50MB/ファイル。bytesをStreamlitのメモリキャッシュに保持しない。
+# プロセス内の一時ディスクに最大3初期値だけ保存し、再取得を減らす。
+_MSM_DISK_DIR = Path(tempfile.gettempdir()) / "tropomi_msm_grib2"
+
+
+def download_msm_grib(cycle: datetime) -> Path:
+    """GRIB2をディスクへストリーミング保存し、Pathだけ返す。"""
+    _MSM_DISK_DIR.mkdir(parents=True, exist_ok=True)
+    target = _MSM_DISK_DIR / f"{cycle:%Y%m%d%H}_msm_p.grib2"
+    if target.exists() and target.stat().st_size > 1_000_000:
+        return target
     url = msm_grib_url(cycle)
+    part = target.with_suffix(".part")
     try:
         with requests.get(url, stream=True, timeout=(30, 300),
                           headers={"User-Agent": "TROPOMI-SO2-Viewer/2.0"}) as response:
             if response.status_code == 404:
                 raise RuntimeError(f"MSM気圧面GRIB2が見つかりません：{url}")
             response.raise_for_status()
-            buffer = io.BytesIO()
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    buffer.write(chunk)
-            return buffer.getvalue()
+            with part.open("wb") as output:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        output.write(chunk)
+        if part.stat().st_size < 1_000_000:
+            raise RuntimeError("GRIB2の取得サイズが異常です。")
+        part.replace(target)
+        # 古いファイルを整理。ディスク使用量を抑える。
+        paths = sorted(_MSM_DISK_DIR.glob("*_msm_p.grib2"),
+                       key=lambda f: f.stat().st_mtime, reverse=True)
+        for old in paths[3:]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        return target
     except requests.RequestException as error:
         raise RuntimeError(f"MSM GRIB2取得エラー（{url}）：{error}") from error
+    finally:
+        try:
+            part.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
-def _read_grib_component(path: Path, short_name: str, step: int,
-                         pressure_level: int):
-    """ecCodesでGRIBメッセージを直接選択する（cfgribの座標結合に依存しない）。"""
+def _read_grib_fields(path: Path, pressure_level: int, required_steps: tuple):
+    """1回のGRIB走査で必要な気圧面・FH・u/v/ghだけ展開する。"""
     try:
         import eccodes as ec
     except ImportError as error:
-        raise RuntimeError(
-            "GRIB2読み込みにはeccodesが必要です。requirements_msm_grib2.txtを確認してください。"
-        ) from error
-
-    # JMA MSM-Pは1つのGRIB2メッセージ内に多数の場を格納する
-    # multi-field GRIB2形式。ecCodesはデフォルトでは先頭の場しか
-    # 返さないため、必ずmulti-field supportを有効化する。
-    # 無効のままだと先頭の高度場だけが見え、u/vのFH一覧が[]になる。
-    try:
-        ec.codes_grib_multi_support_on()
-    except AttributeError as error:
-        raise RuntimeError(
-            "使用中のeccodesがmulti-field GRIB2の読み込みに対応していません。"
-            "eccodesを更新してください。"
-        ) from error
-
+        raise RuntimeError("GRIB2読み込みにはeccodesが必要です。") from error
+    ec.codes_grib_multi_support_on()
+    selected = {}
     available = set()
+    wanted = {(name, int(step)) for name in ("u", "v", "gh")
+              for step in required_steps}
     with path.open("rb") as fh:
         while True:
             gid = ec.codes_grib_new_from_file(fh)
@@ -860,121 +873,101 @@ def _read_grib_component(path: Path, short_name: str, step: int,
             try:
                 try:
                     name = str(ec.codes_get(gid, "shortName"))
+                    if name not in ("u", "v", "gh"):
+                        continue
                     level_type = str(ec.codes_get(gid, "typeOfLevel"))
+                    if level_type not in ("isobaricInhPa", "isobaricInPa"):
+                        continue
                     level = float(ec.codes_get(gid, "level"))
-                    # forecastTimeはGRIB2の時間単位に依存するため、stepUnitsを時間に正規化。
+                    level_hpa = level / 100 if level_type == "isobaricInPa" else level
+                    if abs(level_hpa - pressure_level) > 0.01:
+                        continue
                     step_hours = float(ec.codes_get(gid, "endStep", ktype=float))
-                    step_units = str(ec.codes_get(gid, "stepUnits"))
-                    if step_units in ("m", "min"):
-                        step_hours /= 60.0
-                    elif step_units in ("s", "sec"):
-                        step_hours /= 3600.0
-                    elif step_units in ("d", "day"):
-                        step_hours *= 24.0
-                except Exception:
-                    continue
-                if name != short_name or level_type not in ("isobaricInhPa", "isobaricInPa"):
-                    continue
-                level_hpa = level / 100.0 if level_type == "isobaricInPa" else level
-                if abs(level_hpa - pressure_level) > 0.01:
-                    continue
-                available.add(round(step_hours, 4))
-                if abs(step_hours - step) > 1e-6:
-                    continue
-                values = np.asarray(ec.codes_get_array(gid, "values"), dtype=float)
-                lats = np.asarray(ec.codes_get_array(gid, "latitudes"), dtype=float)
-                lons = np.asarray(ec.codes_get_array(gid, "longitudes"), dtype=float)
-                try:
-                    nj = int(ec.codes_get(gid, "Nj"))
+                    units = str(ec.codes_get(gid, "stepUnits"))
+                    if units in ("m", "min"):
+                        step_hours /= 60
+                    elif units in ("s", "sec"):
+                        step_hours /= 3600
+                    elif units in ("d", "day"):
+                        step_hours *= 24
+                    available.add((name, round(step_hours, 3)))
+                    step = round(step_hours)
+                    if abs(step_hours - step) > 1e-6 or (name, step) not in wanted:
+                        continue
+                    if (name, step) in selected:
+                        continue
+                    # 配列展開は、必要な場に限る。緯度経度は最初の場だけ取得。
                     ni = int(ec.codes_get(gid, "Ni"))
-                except Exception:
-                    nj = int(ec.codes_get(gid, "Ny"))
-                    ni = int(ec.codes_get(gid, "Nx"))
-                if values.size != ni * nj:
-                    raise RuntimeError("GRIB2の格子点数と値の数が一致しません。")
-                return values.reshape(nj, ni), (lats.reshape(nj, ni), lons.reshape(nj, ni))
+                    nj = int(ec.codes_get(gid, "Nj"))
+                    values = np.asarray(ec.codes_get_array(gid, "values"), dtype=np.float32)
+                    if values.size != ni * nj:
+                        raise RuntimeError("GRIB2の格子点数が一致しません。")
+                    if not selected:
+                        lats = np.asarray(ec.codes_get_array(gid, "latitudes"), dtype=np.float32).reshape(nj, ni)
+                        lons = np.asarray(ec.codes_get_array(gid, "longitudes"), dtype=np.float32).reshape(nj, ni)
+                    selected[(name, step)] = values.reshape(nj, ni)
+                    if wanted.issubset(selected):
+                        break
+                except (KeyError, ValueError, TypeError):
+                    continue
             finally:
                 ec.codes_release(gid)
-    raise RuntimeError(
-        f"{pressure_level} hPaの{short_name}でFH{step}が見つかりません。"
-        f"このファイルに含まれる予報時間：{sorted(available)}"
-    )
+    for step in required_steps:
+        for name in ("u", "v"):
+            if (name, step) not in selected:
+                found = sorted(fh for n, fh in available if n == name)
+                raise RuntimeError(f"{pressure_level} hPaの{name}でFH{step}が見つかりません。収録FH：{found}")
+    return selected, lats, lons
 
 
-@st.cache_data(show_spinner=False, ttl=86400, max_entries=80)
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=12)
 def fetch_msm_p_field(target_date: date, utc_hour: int, pressure_level: int,
                       crater_latitude: float, crater_longitude: float):
-    """MSM-Pの3時間間隔の場を取得し、間の正時は時間線形内挿する。
-
-    RISHのL-pall_FH00-15ファイルに含まれるFHは0,3,6,9,12,15。
-    FH1/FH2は存在しないため、存在しないFHを探索し続けない。
-    """
+    """必要なFHだけ読み込み、火口周辺の小さな配列だけキャッシュする。"""
     valid_utc = datetime.combine(target_date, time(hour=int(utc_hour)))
     cycle, step = msm_cycle_and_step(valid_utc)
-    # cycle は直前の3時間毎の初期時刻。FH0とFH3は同一ファイル内。
-    raw = download_msm_grib(cycle)
+    path = download_msm_grib(cycle)
+    required = (0,) if step == 0 else (0, 3)
     try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "msm.grib2"
-            path.write_bytes(raw)
-            def read_at(fh):
-                u, (lats, lons) = _read_grib_component(path, "u", fh, pressure_level)
-                v, _ = _read_grib_component(path, "v", fh, pressure_level)
-                try:
-                    height, _ = _read_grib_component(path, "gh", fh, pressure_level)
-                except RuntimeError:
-                    height = None
-                return u, v, height, lats, lons
-            u0, v0, h0, lats, lons = read_at(0)
-            if step == 0:
-                u, v, height = u0, v0, h0
-            else:
-                u3, v3, h3, lats3, lons3 = read_at(3)
-                if (u0.shape != u3.shape or v0.shape != v3.shape
-                        or lats.shape != lats3.shape or lons.shape != lons3.shape
-                        or not np.allclose(lats, lats3)
-                        or not np.allclose(lons, lons3)):
-                    raise RuntimeError("MSM-PのFH0とFH3の格子が一致しません。")
-                weight = step / 3.0
-                u = (1 - weight) * u0 + weight * u3
-                v = (1 - weight) * v0 + weight * v3
-                height = ((1 - weight) * h0 + weight * h3
-                          if h0 is not None and h3 is not None else None)
+        fields, lats, lons = _read_grib_fields(path, pressure_level, required)
     except (RuntimeError, OSError, ValueError) as error:
         raise RuntimeError(
             f"{valid_utc:%Y-%m-%d %H}UTC・{pressure_level}hPaの風速場取得に失敗。"
-            f"初期時刻{cycle:%Y-%m-%d %H}UTC、FH0/FH3：{error}"
+            f"初期時刻{cycle:%Y-%m-%d %H}UTC：{error}"
         ) from error
-
-    if lats.ndim == 1 and lons.ndim == 1:
-        lon_grid, lat_grid = np.meshgrid(lons, lats)
-    else:
-        lat_grid, lon_grid = lats, lons
-    if u.shape != lat_grid.shape or v.shape != lat_grid.shape:
-        raise RuntimeError("GRIB2の風速成分と緯度経度格子の形状が一致しません。")
-    region = ((lat_grid >= crater_latitude - 1.2) &
-              (lat_grid <= crater_latitude + 1.2) &
-              (lon_grid >= crater_longitude - 1.5) &
-              (lon_grid <= crater_longitude + 1.5))
+    # まず空間的に切り出す。内挿時にも全域の配列を作らない。
+    region = ((lats >= crater_latitude - 1.2) &
+              (lats <= crater_latitude + 1.2) &
+              (lons >= crater_longitude - 1.5) &
+              (lons <= crater_longitude + 1.5))
     if not np.any(region):
         raise RuntimeError("火口周辺にMSMの格子点がありません。")
     rows, cols = np.where(region)
-    r0, r1 = rows.min(), rows.max() + 1
-    c0, c1 = cols.min(), cols.max() + 1
-    lat_grid = lat_grid[r0:r1, c0:c1]
-    lon_grid = lon_grid[r0:r1, c0:c1]
-    u = u[r0:r1, c0:c1]
-    v = v[r0:r1, c0:c1]
+    r0, r1 = int(rows.min()), int(rows.max()) + 1
+    c0, c1 = int(cols.min()), int(cols.max()) + 1
+    lat_grid = lats[r0:r1, c0:c1].copy()
+    lon_grid = lons[r0:r1, c0:c1].copy()
+    def field_value(name):
+        f0 = fields.get((name, 0))
+        if f0 is None:
+            return None
+        first = f0[r0:r1, c0:c1]
+        if step == 0:
+            return first.copy()
+        f3 = fields.get((name, 3))
+        if f3 is None:
+            return None
+        return ((1.0 - step / 3.0) * first +
+                (step / 3.0) * f3[r0:r1, c0:c1]).astype(np.float32)
+    u, v, height = field_value("u"), field_value("v"), field_value("gh")
     x_grid, y_grid = local_xy_m(lat_grid, lon_grid, crater_latitude, crater_longitude)
     valid = np.isfinite(u) & np.isfinite(v)
     if not np.any(valid):
         raise RuntimeError("MSMの風速データが欠測しています。")
     geopotential_height = None
     if height is not None:
-        height_crop = height[r0:r1, c0:c1]
-        closest = np.argmin(np.where(np.isfinite(height_crop),
-                    x_grid**2 + y_grid**2, np.inf))
-        value = float(height_crop.ravel()[closest])
+        closest = int(np.argmin(np.where(np.isfinite(height), x_grid**2 + y_grid**2, np.inf)))
+        value = float(height.ravel()[closest])
         if np.isfinite(value):
             geopotential_height = value
     return {"lat_grid": lat_grid, "lon_grid": lon_grid,
