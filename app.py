@@ -5,6 +5,7 @@ import os
 import tempfile
 from bisect import bisect_right
 from pathlib import Path
+from functools import lru_cache
 from datetime import date, datetime, time, timedelta, timezone
 
 import time as time_module
@@ -920,22 +921,15 @@ def _read_grib_fields(path: Path, pressure_level: int, required_steps: tuple):
     return selected, lats, lons
 
 
-@st.cache_data(show_spinner=False, ttl=3600, max_entries=12)
-def fetch_msm_p_field(target_date: date, utc_hour: int, pressure_level: int,
-                      crater_latitude: float, crater_longitude: float):
-    """必要なFHだけ読み込み、火口周辺の小さな配列だけキャッシュする。"""
-    valid_utc = datetime.combine(target_date, time(hour=int(utc_hour)))
-    cycle, step = msm_cycle_and_step(valid_utc)
+@lru_cache(maxsize=4)
+def _load_cycle_region(cycle: datetime, pressure_level: int,
+                       crater_latitude: float, crater_longitude: float):
+    """同じ初期値・気圧面のGRIB2は1回だけ走査する（LRU最大4組）。
+
+    FH0/FH3を一括抽出し、キャッシュには火口周辺の小配列だけを保持する。
+    """
     path = download_msm_grib(cycle)
-    required = (0,) if step == 0 else (0, 3)
-    try:
-        fields, lats, lons = _read_grib_fields(path, pressure_level, required)
-    except (RuntimeError, OSError, ValueError) as error:
-        raise RuntimeError(
-            f"{valid_utc:%Y-%m-%d %H}UTC・{pressure_level}hPaの風速場取得に失敗。"
-            f"初期時刻{cycle:%Y-%m-%d %H}UTC：{error}"
-        ) from error
-    # まず空間的に切り出す。内挿時にも全域の配列を作らない。
+    fields, lats, lons = _read_grib_fields(path, pressure_level, (0, 3))
     region = ((lats >= crater_latitude - 1.2) &
               (lats <= crater_latitude + 1.2) &
               (lons >= crater_longitude - 1.5) &
@@ -947,20 +941,39 @@ def fetch_msm_p_field(target_date: date, utc_hour: int, pressure_level: int,
     c0, c1 = int(cols.min()), int(cols.max()) + 1
     lat_grid = lats[r0:r1, c0:c1].copy()
     lon_grid = lons[r0:r1, c0:c1].copy()
+    small = {key: arr[r0:r1, c0:c1].copy() for key, arr in fields.items()}
+    x_grid, y_grid = local_xy_m(lat_grid, lon_grid, crater_latitude, crater_longitude)
+    return small, lat_grid, lon_grid, x_grid, y_grid
+
+
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=12)
+def fetch_msm_p_field(target_date: date, utc_hour: int, pressure_level: int,
+                      crater_latitude: float, crater_longitude: float):
+    """既存と同じFH0/FH3線形内挿。初期値ごとの重複GRIB走査を排除。"""
+    valid_utc = datetime.combine(target_date, time(hour=int(utc_hour)))
+    cycle, step = msm_cycle_and_step(valid_utc)
+    try:
+        fields, lat_grid, lon_grid, x_grid, y_grid = _load_cycle_region(
+            cycle, pressure_level, crater_latitude, crater_longitude)
+    except (RuntimeError, OSError, ValueError) as error:
+        raise RuntimeError(
+            f"{valid_utc:%Y-%m-%d %H}UTC・{pressure_level}hPaの風速場取得に失敗。"
+            f"初期時刻{cycle:%Y-%m-%d %H}UTC：{error}"
+        ) from error
+
     def field_value(name):
         f0 = fields.get((name, 0))
         if f0 is None:
             return None
-        first = f0[r0:r1, c0:c1]
         if step == 0:
-            return first.copy()
+            return f0.copy()
         f3 = fields.get((name, 3))
         if f3 is None:
             return None
-        return ((1.0 - step / 3.0) * first +
-                (step / 3.0) * f3[r0:r1, c0:c1]).astype(np.float32)
+        return ((1.0 - step / 3.0) * f0 +
+                (step / 3.0) * f3).astype(np.float32)
+
     u, v, height = field_value("u"), field_value("v"), field_value("gh")
-    x_grid, y_grid = local_xy_m(lat_grid, lon_grid, crater_latitude, crater_longitude)
     valid = np.isfinite(u) & np.isfinite(v)
     if not np.any(valid):
         raise RuntimeError("MSMの風速データが欠測しています。")
