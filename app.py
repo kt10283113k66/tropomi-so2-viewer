@@ -60,6 +60,18 @@ def _msm_diag(message):
 
 
 
+def _msm_cache_diagnostic(stage: str):
+    """診断ログのみ。キャッシュの削除・更新や解析値の変更は行わない。"""
+    info = _load_cycle_regions.cache_info()
+    _msm_diag(
+        f"キャッシュ診断 [{stage}] "
+        f"GRIB領域LRU hits={info.hits}, misses={info.misses}, "
+        f"保持={info.currsize}/{info.maxsize}; "
+        "正時風速Streamlit cache_data TTL=3600秒, max_entries=12 "
+        "(実保持件数は公開APIで取得不可)"
+    )
+
+
 @st.cache_data(show_spinner=False)
 def load_volcanoes() -> list[dict]:
     """volcanoes.jsonから火山・火口位置を読み込む。"""
@@ -2517,6 +2529,10 @@ if run:
                 progress_status.info(f"TROPOMI取得: {message}（経過 {elapsed:.1f} 秒）")
                 print(f"[TROPOMI] {elapsed:.1f}s {message}", flush=True)
 
+            # 解析開始時のRSSとキャッシュ利用状況を記録する。
+            # モデル計算・データ取得・キャッシュの保持条件には影響しない。
+            _msm_diag_callback_token = _MSM_DIAGNOSTIC.set(report_progress)
+            _msm_cache_diagnostic("解析開始")
             report_progress("CDSE認証中")
             token = get_access_token(
                 client_id,
@@ -2786,6 +2802,7 @@ if run:
                         "モデル計算に失敗しました。"
                     )
 
+        _msm_cache_diagnostic("モデル処理終了")
         _MSM_DIAGNOSTIC.set(None)
         report_progress("解析完了・表示用データを保存中")
         st.session_state["viewer"] = {
@@ -2831,6 +2848,9 @@ if run:
             "volcano_name": volcano_name,
             "zoom": 8,
         }
+        _MSM_DIAGNOSTIC.set(report_progress)
+        _msm_cache_diagnostic("解析終了・表示データ保存後")
+        _MSM_DIAGNOSTIC.reset(_msm_diag_callback_token)
         report_progress("完了")
 
     except requests.Timeout:
