@@ -68,9 +68,10 @@ def _msm_cache_diagnostic(stage: str):
     _msm_diag(
         f"キャッシュ診断 [{stage}] "
         f"GRIB領域LRU hits={info.hits}, misses={info.misses}, "
-        f"保持={info.currsize}/{info.maxsize}; "
-        "正時風速Streamlit cache_data TTL=3600秒, max_entries=12 "
-        "(実保持件数は公開APIで取得不可)"
+        f"保持={info.currsize}/{info.maxsize}; " + ("正時風速Streamlit cache_data TTL=3600秒, max_entries=12 "
+         "(実保持件数は公開APIで取得不可)"
+         if MSM_HOURLY_STREAMLIT_CACHE_ENABLED else
+         "正時風速Streamlit cache_data=無効（比較実験）")
     )
 
 
@@ -131,8 +132,9 @@ def _memory_ownership_diagnostic(stage: str):
             f"メモリ内訳 [{stage}] session_state概算={total/1048576:.1f}MiB "
             f"({len(session)}キー; {top}); GC追跡={tracked}個 "
             f"(うちndarray={tracked_arrays}個), GC世代カウント={counts}, "
-            f"累積回収={tuple(item['collected'] for item in stats)}; "
-            "Streamlit cache_data実保持容量は公開APIから取得不可"
+            f"累積回収={tuple(item['collected'] for item in stats)}; " + ("Streamlit cache_data実保持容量は公開APIから取得不可"
+             if MSM_HOURLY_STREAMLIT_CACHE_ENABLED else
+             "正時風速Streamlit cache_data=無効（比較実験）")
         )
     except Exception as exc:
         _msm_diag(f"メモリ内訳 [{stage}] 診断失敗: {type(exc).__name__}: {exc}")
@@ -1078,7 +1080,6 @@ def _load_cycle_region(cycle: datetime, pressure_level: int,
     return _load_cycle_regions(cycle, levels, crater_latitude, crater_longitude)[pressure_level]
 
 
-@st.cache_data(show_spinner=False, ttl=3600, max_entries=12)
 def fetch_msm_p_field(target_date: date, utc_hour: int, pressure_level: int,
                       crater_latitude: float, crater_longitude: float):
     """前後の3時間毎のFH0（解析初期値）だけから正時風速場を線形内挿する。"""
@@ -1141,6 +1142,17 @@ def fetch_msm_p_field(target_date: date, utc_hour: int, pressure_level: int,
             "source_analysis_times": [cycle0.strftime("%Y-%m-%d %H:%M UTC")] +
                 ([cycle1.strftime("%Y-%m-%d %H:%M UTC")] if cycle1 else []),
             "geopotential_height_m": geopotential_height}
+
+
+
+# 比較実験: 正時風速場のStreamlitキャッシュだけを無効化する。
+# 物理計算・FH0内挿・LRUキャッシュ・ダウンロード済みファイル再利用は変更しない。
+# 実験後はこの1行を True に戻すと従来のStreamlitキャッシュ設定に復帰する。
+MSM_HOURLY_STREAMLIT_CACHE_ENABLED = False
+if MSM_HOURLY_STREAMLIT_CACHE_ENABLED:
+    fetch_msm_p_field = st.cache_data(
+        show_spinner=False, ttl=3600, max_entries=12
+    )(fetch_msm_p_field)
 
 
 def build_time_varying_msm_field(end_utc: datetime, pressure_level: int,
