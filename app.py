@@ -41,13 +41,22 @@ VOLCANO_FILE = Path(__file__).resolve().parent / "volcanoes.json"
 
 # 診断専用: Streamlitセッションごとの進捗通知。計算式・数値には影響しない。
 _MSM_DIAGNOSTIC = contextvars.ContextVar("msm_diagnostic", default=None)
+_MSM_ACTIVE_LEVELS = contextvars.ContextVar("msm_active_levels", default=(900, 850, 800))
 
 def _msm_diag(message):
     callback = _MSM_DIAGNOSTIC.get()
     if callback is not None:
         # Linuxのru_maxrssは最大常駐メモリ(KiB)。現在値ではなくピーク値。
         peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
-        callback(f"MSM-P: {message} / プロセス最大RSS {peak_mb:.0f} MB")
+        # /proc/self/statmのresidentは現在RSS。最大RSSと区別する。
+        try:
+            with open("/proc/self/statm", "r", encoding="ascii") as statm:
+                resident_pages = int(statm.read().split()[1])
+            current_mb = resident_pages * os.sysconf("SC_PAGE_SIZE") / 1048576
+            memory_note = f"現在RSS {current_mb:.0f} MB / 最大RSS {peak_mb:.0f} MB"
+        except (OSError, ValueError, IndexError):
+            memory_note = f"最大RSS {peak_mb:.0f} MB"
+        callback(f"MSM-P: {message} / {memory_note}")
 
 
 
@@ -767,7 +776,7 @@ def msm_grib_url(cycle: datetime) -> str:
 
 
 # GRIB2は約50MB/ファイル。bytesをStreamlitのメモリキャッシュに保持しない。
-# プロセス内の一時ディスクに最大3初期値だけ保存し、再取得を減らす。
+# プロセス内の一時ディスクに最大8初期値だけ保存し、再取得を減らす。
 _MSM_DISK_DIR = Path(tempfile.gettempdir()) / "tropomi_msm_grib2"
 
 
@@ -804,7 +813,7 @@ def download_msm_grib(cycle: datetime) -> Path:
         # 古いファイルを整理。ディスク使用量を抑える。
         paths = sorted(_MSM_DISK_DIR.glob("*_msm_p.grib2"),
                        key=lambda f: f.stat().st_mtime, reverse=True)
-        for old in paths[3:]:
+        for old in paths[8:]:
             try:
                 old.unlink()
             except OSError:
@@ -891,28 +900,104 @@ def _read_grib_fields(path: Path, pressure_level: int, required_steps: tuple):
     return selected, lats, lons
 
 
-@lru_cache(maxsize=6)
+def _read_grib_fields_levels(path: Path, pressure_levels: tuple):
+    """GRIB2を一度だけ走査して、指定した全気圧面のFH0をまとめて抽出する。"""
+    import eccodes as ec
+    levels = tuple(sorted(set(int(level) for level in pressure_levels)))
+    required = {(level, name) for level in levels for name in ("u", "v", "gh")}
+    selected = {}
+    grids = {}
+    scanned = 0
+    _msm_diag(f"{path.name} {levels}hPa 一括GRIB2走査開始")
+    ec.codes_grib_multi_support_on()
+    with path.open("rb") as fh:
+        while True:
+            gid = ec.codes_grib_new_from_file(fh)
+            if gid is None:
+                break
+            scanned += 1
+            try:
+                try:
+                    name = str(ec.codes_get(gid, "shortName"))
+                    if name not in ("u", "v", "gh"):
+                        continue
+                    kind = str(ec.codes_get(gid, "typeOfLevel"))
+                    if kind not in ("isobaricInhPa", "isobaricInPa"):
+                        continue
+                    level = float(ec.codes_get(gid, "level"))
+                    if kind == "isobaricInPa":
+                        level /= 100
+                    rounded = round(level)
+                    if abs(level - rounded) > 0.01 or rounded not in levels:
+                        continue
+                    step = float(ec.codes_get(gid, "endStep", ktype=float))
+                    unit = str(ec.codes_get(gid, "stepUnits"))
+                    if unit in ("m", "min"):
+                        step /= 60
+                    elif unit in ("s", "sec"):
+                        step /= 3600
+                    elif unit in ("d", "day"):
+                        step *= 24
+                    if abs(step) > 1e-6 or (rounded, name) in selected:
+                        continue
+                    ni = int(ec.codes_get(gid, "Ni"))
+                    nj = int(ec.codes_get(gid, "Nj"))
+                    values = np.asarray(ec.codes_get_array(gid, "values"), dtype=np.float32)
+                    if values.size != ni * nj:
+                        raise RuntimeError("GRIB2の格子点数が一致しません。")
+                    if rounded not in grids:
+                        lat = np.asarray(ec.codes_get_array(gid, "latitudes"), dtype=np.float32).reshape(nj, ni)
+                        lon = np.asarray(ec.codes_get_array(gid, "longitudes"), dtype=np.float32).reshape(nj, ni)
+                        grids[rounded] = (lat, lon)
+                    selected[(rounded, name)] = values.reshape(nj, ni)
+                    if required.issubset(selected):
+                        break
+                except (KeyError, ValueError, TypeError):
+                    continue
+            finally:
+                ec.codes_release(gid)
+            if scanned % 150 == 0:
+                _msm_diag(f"一括GRIB2走査 {scanned}メッセージ")
+    _msm_diag(f"一括GRIB2走査完了 {scanned}メッセージ / {len(selected)}場")
+    for level in levels:
+        for name in ("u", "v"):
+            if (level, name) not in selected:
+                raise RuntimeError(f"{level}hPaのFH0 {name}が見つかりません。")
+    return selected, grids
+
+
+@lru_cache(maxsize=4)
+def _load_cycle_regions(cycle: datetime, pressure_levels: tuple,
+                        crater_latitude: float, crater_longitude: float):
+    """必要な全気圧面を一括抽出し、火口周辺の小配列のみキャッシュする。"""
+    path = download_msm_grib(cycle)
+    all_fields, grids = _read_grib_fields_levels(path, pressure_levels)
+    result = {}
+    for level in pressure_levels:
+        lats, lons = grids[level]
+        region = ((lats >= crater_latitude - 1.2) &
+                  (lats <= crater_latitude + 1.2) &
+                  (lons >= crater_longitude - 1.5) &
+                  (lons <= crater_longitude + 1.5))
+        if not np.any(region):
+            raise RuntimeError(f"{level}hPa: 火口周辺にMSMの格子点がありません。")
+        rows, cols = np.where(region)
+        r0, r1 = int(rows.min()), int(rows.max()) + 1
+        c0, c1 = int(cols.min()), int(cols.max()) + 1
+        lat_grid = lats[r0:r1, c0:c1].copy()
+        lon_grid = lons[r0:r1, c0:c1].copy()
+        small = {(name, 0): all_fields[(level, name)][r0:r1, c0:c1].copy()
+                 for name in ("u", "v", "gh") if (level, name) in all_fields}
+        x_grid, y_grid = local_xy_m(lat_grid, lon_grid, crater_latitude, crater_longitude)
+        result[level] = (small, lat_grid, lon_grid, x_grid, y_grid)
+    _msm_diag(f"{cycle:%m/%d %H}UTC {pressure_levels}hPa 領域切出し完了")
+    return result
+
+
 def _load_cycle_region(cycle: datetime, pressure_level: int,
                        crater_latitude: float, crater_longitude: float):
-    """FH0のみを読み込み、火口周辺の小配列をキャッシュする。"""
-    _msm_diag(f"{cycle:%m/%d %H}UTC {pressure_level}hPa 風速場準備開始")
-    path = download_msm_grib(cycle)
-    fields, lats, lons = _read_grib_fields(path, pressure_level, (0,))
-    region = ((lats >= crater_latitude - 1.2) &
-              (lats <= crater_latitude + 1.2) &
-              (lons >= crater_longitude - 1.5) &
-              (lons <= crater_longitude + 1.5))
-    if not np.any(region):
-        raise RuntimeError("火口周辺にMSMの格子点がありません。")
-    rows, cols = np.where(region)
-    r0, r1 = int(rows.min()), int(rows.max()) + 1
-    c0, c1 = int(cols.min()), int(cols.max()) + 1
-    lat_grid = lats[r0:r1, c0:c1].copy()
-    lon_grid = lons[r0:r1, c0:c1].copy()
-    small = {key: arr[r0:r1, c0:c1].copy() for key, arr in fields.items()}
-    x_grid, y_grid = local_xy_m(lat_grid, lon_grid, crater_latitude, crater_longitude)
-    _msm_diag(f"{cycle:%m/%d %H}UTC {pressure_level}hPa 領域切出し完了")
-    return small, lat_grid, lon_grid, x_grid, y_grid
+    levels = tuple(sorted(set(_MSM_ACTIVE_LEVELS.get()) | {int(pressure_level)}))
+    return _load_cycle_regions(cycle, levels, crater_latitude, crater_longitude)[pressure_level]
 
 
 @st.cache_data(show_spinner=False, ttl=3600, max_entries=12)
@@ -2559,6 +2644,8 @@ if run:
                 # 自動ピークの有無にかかわらずMSM-P風場は取得する。
                 # これにより、自動検出失敗時でも後から任意地点で
                 # 手動フィッティングできる。
+                # 同一GRIB2ファイルは選択気圧面をまとめて一度だけ走査する。
+                _MSM_ACTIVE_LEVELS.set(tuple(sorted(set(int(p) for p in selected_pressure_levels))))
                 report_progress(f"MSM-P候補計算開始（{len(selected_jst_hours)}時刻 × {len(selected_pressure_levels)}気圧面）")
                 for jst_hour in sorted(selected_jst_hours):
                     # 選択日JSTからUTC日時へ変換する。
