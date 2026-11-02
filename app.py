@@ -16,7 +16,6 @@ import requests
 import streamlit as st
 import xarray as xr
 from scipy.spatial import cKDTree
-from scipy.ndimage import label as connected_component_label
 from branca.element import Element
 from folium.plugins import Fullscreen, MousePosition
 from PIL import Image, ImageDraw
@@ -34,7 +33,6 @@ MODEL_LOOKBACK_HOURS = 5
 MODEL_TIME_STEP_MINUTES = 5
 SO2_MOLAR_MASS_KG_MOL = 0.064066
 PLUME_THRESHOLD_MOL_M2 = 0.001
-MIN_CONNECTED_PLUME_PIXELS = 3
 MAX_DIRECTION_DIFFERENCE_DEG = 45.0
 
 VOLCANO_FILE = Path(__file__).resolve().parent / "volcanoes.json"
@@ -515,7 +513,7 @@ def request_process_rectangular(
         )
     if not response.ok:
         raise RuntimeError(
-            f"連結判定用データ取得に失敗しました（HTTP {response.status_code}）。\n"
+            f"ピーク判定用データ取得に失敗しました（HTTP {response.status_code}）。\n"
             f"{response.text[:1000]}"
         )
     return response.content
@@ -527,7 +525,7 @@ def plume_detection_grid_size(
     target_ns_km: float = 3.5,
     target_ew_km: float = 7.0,
 ) -> tuple[int, int]:
-    """TROPOMI相当の物理分解能から連結判定用の幅・高さを求める。"""
+    """TROPOMI相当の物理分解能からピーク判定用の幅・高さを求める。"""
     north_south_km = abs(bbox[3] - bbox[1]) * 111.32
     east_west_km = (
         abs(bbox[2] - bbox[0])
@@ -619,13 +617,9 @@ def find_annulus_maximum(
     min_distance_km: float = 10.0,
     max_distance_km: float = 30.0,
     threshold_mol_m2: float = PLUME_THRESHOLD_MOL_M2,
-    min_connected_pixels: int = MIN_CONNECTED_PLUME_PIXELS,
 ):
     """
-    10～30 km環状帯で、閾値以上の8近傍連結成分を抽出する。
-
-    3画素以上が辺または角で隣接する成分だけをプルーム候補とし、
-    候補成分内で最も高いSO₂カラム濃度をピークとして返す。
+    10～30 km環状帯の閾値以上の画素から最大濃度を返す。
     """
     rows, cols = np.indices(array.shape)
 
@@ -655,72 +649,20 @@ def find_annulus_maximum(
     if not np.any(plume_mask):
         return None
 
-    # 8近傍（上下左右＋斜め）で連結成分を判定する。
-    structure = np.ones((3, 3), dtype=np.uint8)
-    labels, component_count = connected_component_label(
-        plume_mask,
-        structure=structure,
-    )
-
-    valid_components = []
-    for component_id in range(1, component_count + 1):
-        component_mask = labels == component_id
-        pixel_count = int(np.count_nonzero(component_mask))
-
-        if pixel_count < int(min_connected_pixels):
-            continue
-
-        component_values = np.where(
-            component_mask,
-            array,
-            -np.inf,
-        )
-        flat_index = int(np.argmax(component_values))
-        row, col = np.unravel_index(
-            flat_index,
-            component_values.shape,
-        )
-
-        valid_components.append(
-            {
-                "row": int(row),
-                "col": int(col),
-                "pixel_count": pixel_count,
-                "peak_value": float(array[row, col]),
-            }
-        )
-
-    if not valid_components:
-        return None
-
-    selected = max(
-        valid_components,
-        key=lambda item: item["peak_value"],
-    )
-    row = selected["row"]
-    col = selected["col"]
-
+    # 連結成分の判定は行わず、環状帯内の閾値以上の最大画素を採用する。
+    # 画素格子は従来のTROPOMI相当の粗い判定格子を維持する。
+    candidate_values = np.where(plume_mask, array, -np.inf)
+    flat_index = int(np.argmax(candidate_values))
+    row, col = np.unravel_index(flat_index, array.shape)
     max_lat = float(latitudes[row, col])
     max_lon = float(longitudes[row, col])
-
     return {
         "value": float(array[row, col]),
         "latitude": max_lat,
         "longitude": max_lon,
         "distance_km": float(distances[row, col]),
-        "bearing_deg": bearing_deg(
-            crater_lat,
-            crater_lon,
-            max_lat,
-            max_lon,
-        ),
-        "connected_pixel_count": int(
-            selected["pixel_count"]
-        ),
+        "bearing_deg": bearing_deg(crater_lat, crater_lon, max_lat, max_lon),
         "threshold_mol_m2": float(threshold_mol_m2),
-        "minimum_connected_pixels": int(
-            min_connected_pixels
-        ),
     }
 
 
@@ -1761,7 +1703,7 @@ def create_so2_map_export_png(
                         f"{zoom}/{tile_x}/{tile_y}.png"
                     ),
                     headers=headers,
-                    timeout=20,
+                    timeout=(3, 5),
                 )
                 response.raise_for_status()
                 tile = Image.open(
@@ -2240,17 +2182,6 @@ with st.sidebar:
         format_func=lambda value: f"{value} × {value}",
     )
 
-    use_connected_plume_detection = st.checkbox(
-        "連結数でプルーム判定する",
-        value=False,
-        help=(
-            "OFF：10～30 km内の判定格子で0.001 mol/m²以上の"
-            "ピークがあれば採用します。"
-            "ON：閾値以上の画素が8近傍で3個以上連結する場合だけ"
-            "プルームとして採用します。"
-        ),
-    )
-
     crater_lat = float(crater_lat)
     crater_lon = float(crater_lon)
 
@@ -2496,8 +2427,8 @@ if run:
                 mime_type="image/tiff",
             )
 
-            report_progress("SO₂数値取得完了・連結判定データ取得中 (3/5)")
-            # 連結判定は表示用768×768等では行わない。
+            report_progress("SO₂数値取得完了・ピーク判定格子取得中 (3/5)")
+            # ピーク検索は表示用768×768等では行わず、従来の粗い格子を使用。
             # 約3.5 km（南北）×7 km（東西）のTROPOMI相当格子を
             # 別途取得し、元画素相当のピクセル数を数える。
             detection_width, detection_height = plume_detection_grid_size(
@@ -2517,7 +2448,7 @@ if run:
                 mime_type="image/tiff",
             )
 
-            report_progress("連結判定データ取得完了・雲量画像取得中 (4/5)")
+            report_progress("ピーク判定格子取得完了・雲量画像取得中 (4/5)")
             cloud_png = request_process(
                 token=token,
                 bbox=bbox,
@@ -2549,12 +2480,7 @@ if run:
             if cloud_array.shape != so2_array.shape:
                 raise RuntimeError("SO₂と雲量の格子形状が一致しません。")
 
-            minimum_connected_pixels = (
-                MIN_CONNECTED_PLUME_PIXELS
-                if use_connected_plume_detection
-                else 1
-            )
-
+            report_progress("10～30 kmの最大濃度検索中")
             maximum = find_annulus_maximum(
                 array=plume_detection_array,
                 transform=plume_detection_transform,
@@ -2563,24 +2489,18 @@ if run:
                 min_distance_km=10.0,
                 max_distance_km=30.0,
                 threshold_mol_m2=PLUME_THRESHOLD_MOL_M2,
-                min_connected_pixels=minimum_connected_pixels,
             )
+            report_progress("最大濃度検索完了")
             if maximum is not None:
                 maximum["detection_grid_width"] = int(detection_width)
                 maximum["detection_grid_height"] = int(detection_height)
                 maximum["detection_resolution_ns_km"] = 3.5
                 maximum["detection_resolution_ew_km"] = 7.0
 
-            so2_map_png, so2_map_tile_error = (
-                create_so2_map_export_png(
-                    so2_png=so2_png,
-                    bbox=bbox,
-                    crater_lat=crater_lat,
-                    crater_lon=crater_lon,
-                    maximum=maximum,
-                    zoom=8,
-                )
-            )
+            # 背景地図タイルの逐次HTTP取得は数分以上ブロックし得るため、
+            # データ取得・モデル計算の経路から除外。保存要求時のみ生成する。
+            so2_map_png, so2_map_tile_error = None, None
+            report_progress("ピーク解析完了・モデル計算へ")
 
             tropomi_resolution = {
                 "ns_km": float(model_resolution_ns_km),
@@ -2736,6 +2656,7 @@ if run:
                         "モデル計算に失敗しました。"
                     )
 
+        report_progress("解析完了・表示用データを保存中")
         st.session_state["viewer"] = {
             "so2_png": so2_png,
             "so2_map_png": so2_map_png,
@@ -2750,9 +2671,6 @@ if run:
             "model_result": model_result,
             "model_error": model_error,
             "run_model_calculation": run_model_calculation,
-            "use_connected_plume_detection": (
-                use_connected_plume_detection
-            ),
             "msm_field": msm_field,
             "model_candidates": model_candidates,
             "msm_candidates": msm_candidates,
@@ -2782,6 +2700,7 @@ if run:
             "volcano_name": volcano_name,
             "zoom": 8,
         }
+        report_progress("完了")
 
     except requests.Timeout:
         st.error(
@@ -2878,17 +2797,7 @@ else:
         maximum = data["maximum"]
 
         if maximum is None:
-            if data.get("use_connected_plume_detection", False):
-                st.warning(
-                    "10～30 km内で、0.001 mol/m²以上の画素が"
-                    "8近傍で3画素以上連結するプルームを"
-                    "検出できませんでした。"
-                )
-            else:
-                st.warning(
-                    "10～30 km内に0.001 mol/m²以上の"
-                    "SO₂ピークを検出できませんでした。"
-                )
+            st.warning("10～30 km内に0.001 mol/m²以上のSO₂ピークを検出できませんでした。")
         else:
             st.metric(
                 "SO₂カラム濃度",
@@ -2907,30 +2816,11 @@ else:
             st.write(
                 f"経度：{maximum['longitude']:.5f}°"
             )
-            if data.get("use_connected_plume_detection", False):
-                st.write(
-                    "連結ピクセル数："
-                    f"**{maximum['connected_pixel_count']}**"
-                )
-                st.write(
-                    "連結判定格子："
-                    f"**{maximum.get('detection_grid_width', '?')} × "
-                    f"{maximum.get('detection_grid_height', '?')}** "
-                    "（約7 km東西 × 3.5 km南北）"
-                )
-                st.caption(
-                    "約3.5 km×7 kmのTROPOMI相当格子で、"
-                    "0.001 mol/m²以上の画素が3画素以上、"
-                    "8近傍で連結した成分内の最大値です。"
-                    "地図上の黄色い★が最大値の位置です。"
-                )
-            else:
-                st.caption(
-                    "連結数判定はOFFです。約3.5 km×7 kmの判定格子で、"
-                    "10～30 km内の0.001 mol/m²以上の画素から"
-                    "最大値を採用しています。"
-                    "地図上の黄色い★が最大値の位置です。"
-                )
+            st.caption(
+                "約3.5 km×7 kmの判定格子で、10～30 km内の"
+                "0.001 mol/m²以上の画素から最大値を採用しています。"
+                "連結画素数による判定は行いません。"
+            )
 
     st.divider()
 
@@ -2939,7 +2829,7 @@ else:
         "地図上の任意のTROPOMI画素をクリックし、"
         "その地点と任意のカラム濃度を使ってモデルを再計算します。"
         "手動フィッティングでは、0.001 mol/m²以上・10～30 km・"
-        "連結数などの自動検出条件は適用しません。"
+        "自動検出条件は適用しません。"
         "自動ピークを検出できなかった場合でも実行できます。"
         "自動計算結果は上書きされません。"
     )
@@ -3569,7 +3459,7 @@ else:
                 )
             )
         st.caption(
-            "ピークが0.001 mol/m²以上、連結3画素以上、"
+            "ピークが0.001 mol/m²以上、"
             "かつ流向差が45°以下の場合のみ放出率を算出します。"
             "推定放出率 ＝ 入力した仮定放出率 × "
             "（TROPOMIピークカラム濃度／モデルピークカラム濃度）。"
@@ -3583,25 +3473,35 @@ else:
             "このため、地表から無限高度までの全カラムでは排出高度は計算値に影響しません。"
         )
 
-    if data.get("so2_map_tile_error"):
-        st.caption(
-            "保存画像の背景地図タイルを一部取得できなかった可能性があります。"
-            "SO₂、火口、10 km円、30 km円は保存画像へ描画されています。"
-        )
-
     download_left, download_right = st.columns(2)
 
     with download_left:
-        st.download_button(
-            "SO₂表示画像を保存（地図・10/30 km円付きPNG）",
-            data=data["so2_map_png"],
-            file_name=(
-                f"tropomi_so2_"
-                f"{data['selected_date'].isoformat()}.png"
-            ),
-            mime="image/png",
-            use_container_width=True,
-        )
+        st.caption("背景地図付きPNGは、必要なときだけ生成します。")
+        if st.button("保存用の地図画像を生成", key="generate_export_map"):
+            with st.spinner("背景地図タイルを取得して画像を生成しています…"):
+                try:
+                    export_png, export_error = create_so2_map_export_png(
+                        so2_png=data["so2_png"],
+                        bbox=data["bbox"],
+                        crater_lat=data["crater_lat"],
+                        crater_lon=data["crater_lon"],
+                        maximum=data["maximum"],
+                        zoom=8,
+                    )
+                    st.session_state["viewer"]["so2_map_png"] = export_png
+                    st.session_state["viewer"]["so2_map_tile_error"] = export_error
+                except Exception as error:
+                    st.error(f"保存用画像の生成に失敗しました: {error}")
+        if data.get("so2_map_tile_error"):
+            st.warning("背景地図タイルの一部を取得できませんでした。")
+        if data.get("so2_map_png") is not None:
+            st.download_button(
+                "SO₂表示画像を保存（地図・10/30 km円付きPNG）",
+                data=data["so2_map_png"],
+                file_name=f"tropomi_so2_{data['selected_date'].isoformat()}.png",
+                mime="image/png",
+                use_container_width=True,
+            )
 
     with download_right:
         st.download_button(
@@ -3637,7 +3537,7 @@ with st.expander("表示・最大値・風データについて"):
 - ピークフィッティング放出率は、入力放出率にTROPOMIピーク／モデルピークの比を乗じて算出します。
 - 地図で選択した任意地点と任意のカラム濃度を使い、取得済みのMSM-P風候補で追加フィッティングできます。
 - 自動ピークを検出できない場合でも、MSM-P風場の取得に成功していれば手動追加フィッティングを実行できます。
-- 手動追加フィッティングでは、0.001 mol/m²以上、10～30 km、連結ピクセル数などの自動ピーク検出条件を適用しません。
+- 手動追加フィッティングでは、0.001 mol/m²以上、10～30 km、自動ピーク検出条件を適用しません。
 - 手動追加フィッティングは自動結果を上書きせず、別枠の参考値として表示します。
 - 補正放出率はピークフィッティング放出率の3倍として表示します。
 - TROPOMIピーク流向とモデルピーク流向は、火口から各ピーク地点への方位角（北0°、東90°、南180°、西270°）です。
