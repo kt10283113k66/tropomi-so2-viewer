@@ -13,6 +13,7 @@ import contextvars
 import gc
 import sys
 import resource
+import tracemalloc
 import folium
 import numpy as np
 import rasterio
@@ -60,6 +61,27 @@ def _msm_diag(message):
             memory_note = f"最大RSS {peak_mb:.0f} MB"
         callback(f"MSM-P: {message} / {memory_note}")
 
+
+
+def _grib_memory_checkpoint(stage: str, **objects):
+    """診断専用。RSS、Python追跡割当、指定配列の実データ容量を記録。"""
+    try:
+        with open("/proc/self/statm", "r", encoding="ascii") as fh:
+            resident = int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1048576
+        current, peak = tracemalloc.get_traced_memory() if tracemalloc.is_tracing() else (0, 0)
+        detail = []
+        for name, obj in objects.items():
+            if isinstance(obj, dict):
+                arrays = [v for v in obj.values() if isinstance(v, np.ndarray)]
+                size = sum(v.nbytes for v in arrays)
+                detail.append(f"{name}={len(arrays)}配列/{size/1048576:.1f}MiB")
+            elif isinstance(obj, np.ndarray):
+                detail.append(f"{name}={obj.nbytes/1048576:.1f}MiB")
+        _msm_diag(f"GRIBメモリ詳細 [{stage}] RSS={resident:.1f}MiB, "
+                  f"tracemalloc現在={current/1048576:.1f}MiB/ピーク={peak/1048576:.1f}MiB; "
+                  + ", ".join(detail))
+    except Exception as exc:
+        _msm_diag(f"GRIBメモリ詳細 [{stage}] 診断失敗: {type(exc).__name__}: {exc}")
 
 
 def _msm_cache_diagnostic(stage: str):
@@ -989,6 +1011,8 @@ def _read_grib_fields_levels(path: Path, pressure_levels: tuple):
     grids = {}
     scanned = 0
     _msm_diag(f"{path.name} {levels}hPa 一括GRIB2走査開始")
+    _grib_memory_checkpoint("GRIB走査直前")
+    _grib_memory_checkpoint("一括GRIB走査直前")
     ec.codes_grib_multi_support_on()
     with path.open("rb") as fh:
         while True:
@@ -1038,6 +1062,7 @@ def _read_grib_fields_levels(path: Path, pressure_levels: tuple):
                 ec.codes_release(gid)
             if scanned % 150 == 0:
                 _msm_diag(f"一括GRIB2走査 {scanned}メッセージ")
+    _grib_memory_checkpoint("一括GRIB走査直後", selected=selected)
     _msm_diag(f"一括GRIB2走査完了 {scanned}メッセージ / {len(selected)}場")
     for level in levels:
         for name in ("u", "v"):
@@ -1050,8 +1075,11 @@ def _read_grib_fields_levels(path: Path, pressure_levels: tuple):
 def _load_cycle_regions(cycle: datetime, pressure_levels: tuple,
                         crater_latitude: float, crater_longitude: float):
     """必要な全気圧面を一括抽出し、火口周辺の小配列のみキャッシュする。"""
+    _grib_memory_checkpoint("サイクル読み込み前")
     path = download_msm_grib(cycle)
+    _grib_memory_checkpoint("GRIBダウンロード/再利用後")
     all_fields, grids = _read_grib_fields_levels(path, pressure_levels)
+    _grib_memory_checkpoint("抽出後・領域切出し前", all_fields=all_fields)
     result = {}
     for level in pressure_levels:
         lats, lons = grids[level]
@@ -1070,6 +1098,7 @@ def _load_cycle_regions(cycle: datetime, pressure_levels: tuple,
                  for name in ("u", "v", "gh") if (level, name) in all_fields}
         x_grid, y_grid = local_xy_m(lat_grid, lon_grid, crater_latitude, crater_longitude)
         result[level] = (small, lat_grid, lon_grid, x_grid, y_grid)
+    _grib_memory_checkpoint("領域切出し後・一時配列保持中", all_fields=all_fields)
     _msm_diag(f"{cycle:%m/%d %H}UTC {pressure_levels}hPa 領域切出し完了")
     return result
 
@@ -1145,10 +1174,9 @@ def fetch_msm_p_field(target_date: date, utc_hour: int, pressure_level: int,
 
 
 
-# 比較実験: 正時風速場のStreamlitキャッシュだけを無効化する。
-# 物理計算・FH0内挿・LRUキャッシュ・ダウンロード済みファイル再利用は変更しない。
-# 実験後はこの1行を True に戻すと従来のStreamlitキャッシュ設定に復帰する。
-MSM_HOURLY_STREAMLIT_CACHE_ENABLED = False
+# 正時風速場のStreamlitキャッシュは通常設定に復帰。
+# メモリ診断は計算式やキャッシュ条件を変更しない。
+MSM_HOURLY_STREAMLIT_CACHE_ENABLED = True
 if MSM_HOURLY_STREAMLIT_CACHE_ENABLED:
     fetch_msm_p_field = st.cache_data(
         show_spinner=False, ttl=3600, max_entries=12
@@ -1161,6 +1189,7 @@ def build_time_varying_msm_field(end_utc: datetime, pressure_level: int,
     start_utc = end_utc - timedelta(hours=MODEL_LOOKBACK_HOURS)
     first_valid = start_utc.replace(minute=0, second=0, microsecond=0)
     fields = []
+    _grib_memory_checkpoint("風速場構築前")
     _msm_diag(f"{pressure_level}hPa 過去{MODEL_LOOKBACK_HOURS}時間の風速場構築開始")
     for hour_offset in range(MODEL_LOOKBACK_HOURS + 1):
         valid_time = first_valid + timedelta(hours=hour_offset)
@@ -1170,6 +1199,7 @@ def build_time_varying_msm_field(end_utc: datetime, pressure_level: int,
         fields.append({"valid_time": valid_time, "field": field})
         _msm_diag(f"{pressure_level}hPa {valid_time:%m/%d %H}UTC 風速場取得完了 ({hour_offset+1}/{MODEL_LOOKBACK_HOURS+1})")
     # 終了時刻の風を代表値とし、既存の表示項目・手動フィッティングとの互換性を維持。
+    _grib_memory_checkpoint("風速場構築後")
     _msm_diag(f"{pressure_level}hPa 過去5時間の風速場構築完了")
     result = dict(fields[-1]["field"])
     result["time_slices"] = fields
@@ -2610,6 +2640,9 @@ if run:
             # 解析開始時のRSSとキャッシュ利用状況を記録する。
             # モデル計算・データ取得・キャッシュの保持条件には影響しない。
             _msm_diag_callback_token = _MSM_DIAGNOSTIC.set(report_progress)
+            if not tracemalloc.is_tracing():
+                tracemalloc.start(5)
+            _grib_memory_checkpoint("解析開始")
             _msm_cache_diagnostic("解析開始")
             _memory_ownership_diagnostic("解析開始")
             report_progress("CDSE認証中")
@@ -2881,6 +2914,7 @@ if run:
                         "モデル計算に失敗しました。"
                     )
 
+        _grib_memory_checkpoint("モデル処理終了")
         _msm_cache_diagnostic("モデル処理終了")
         _memory_ownership_diagnostic("モデル処理終了")
         _MSM_DIAGNOSTIC.set(None)
@@ -2929,6 +2963,7 @@ if run:
             "zoom": 8,
         }
         _MSM_DIAGNOSTIC.set(report_progress)
+        _grib_memory_checkpoint("解析終了・表示データ保存後")
         _msm_cache_diagnostic("解析終了・表示データ保存後")
         _memory_ownership_diagnostic("解析終了・表示データ保存後")
         _MSM_DIAGNOSTIC.reset(_msm_diag_callback_token)
