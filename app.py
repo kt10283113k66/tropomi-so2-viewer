@@ -10,6 +10,8 @@ from datetime import date, datetime, time, timedelta, timezone
 
 import time as time_module
 import contextvars
+import gc
+import sys
 import resource
 import folium
 import numpy as np
@@ -70,6 +72,70 @@ def _msm_cache_diagnostic(stage: str):
         "正時風速Streamlit cache_data TTL=3600秒, max_entries=12 "
         "(実保持件数は公開APIで取得不可)"
     )
+
+
+
+def _approx_retained_size(value, seen=None, depth=0):
+    """診断専用: 到達可能なPython/NumPyオブジェクトの概算サイズ。"""
+    if seen is None:
+        seen = set()
+    identity = id(value)
+    if identity in seen or depth > 12:
+        return 0
+    seen.add(identity)
+    if isinstance(value, np.ndarray):
+        # viewが共有する基底配列は重複計上しないようにする。
+        root = value
+        while isinstance(getattr(root, "base", None), np.ndarray):
+            root = root.base
+        root_id = id(root)
+        if root_id in seen and root_id != identity:
+            return 0
+        seen.add(root_id)
+        return int(root.nbytes) + sys.getsizeof(value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return sys.getsizeof(value)
+    if isinstance(value, dict):
+        return sys.getsizeof(value) + sum(
+            _approx_retained_size(k, seen, depth + 1) +
+            _approx_retained_size(v, seen, depth + 1)
+            for k, v in value.items()
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return sys.getsizeof(value) + sum(
+            _approx_retained_size(v, seen, depth + 1) for v in value
+        )
+    # pandas等の任意オブジェクトを深掘りしない（診断で副作用を起こさない）。
+    try:
+        return sys.getsizeof(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _memory_ownership_diagnostic(stage: str):
+    """キャッシュ・GC・セッション保持量を非破壊で記録する。"""
+    try:
+        # gc.collect()は呼ばず、現在の統計のみ参照する。
+        counts = gc.get_count()
+        stats = gc.get_stats()
+        tracked = len(gc.get_objects())
+        tracked_arrays = sum(isinstance(obj, np.ndarray) for obj in gc.get_objects())
+        session = dict(st.session_state)
+        per_key = sorted(
+            ((str(key), _approx_retained_size(value)) for key, value in session.items()),
+            key=lambda pair: pair[1], reverse=True,
+        )
+        total = sum(size for _, size in per_key)
+        top = ", ".join(f"{key}={size/1048576:.1f}MiB" for key, size in per_key[:6])
+        _msm_diag(
+            f"メモリ内訳 [{stage}] session_state概算={total/1048576:.1f}MiB "
+            f"({len(session)}キー; {top}); GC追跡={tracked}個 "
+            f"(うちndarray={tracked_arrays}個), GC世代カウント={counts}, "
+            f"累積回収={tuple(item['collected'] for item in stats)}; "
+            "Streamlit cache_data実保持容量は公開APIから取得不可"
+        )
+    except Exception as exc:
+        _msm_diag(f"メモリ内訳 [{stage}] 診断失敗: {type(exc).__name__}: {exc}")
 
 
 @st.cache_data(show_spinner=False)
@@ -2533,6 +2599,7 @@ if run:
             # モデル計算・データ取得・キャッシュの保持条件には影響しない。
             _msm_diag_callback_token = _MSM_DIAGNOSTIC.set(report_progress)
             _msm_cache_diagnostic("解析開始")
+            _memory_ownership_diagnostic("解析開始")
             report_progress("CDSE認証中")
             token = get_access_token(
                 client_id,
@@ -2803,6 +2870,7 @@ if run:
                     )
 
         _msm_cache_diagnostic("モデル処理終了")
+        _memory_ownership_diagnostic("モデル処理終了")
         _MSM_DIAGNOSTIC.set(None)
         report_progress("解析完了・表示用データを保存中")
         st.session_state["viewer"] = {
@@ -2850,6 +2918,7 @@ if run:
         }
         _MSM_DIAGNOSTIC.set(report_progress)
         _msm_cache_diagnostic("解析終了・表示データ保存後")
+        _memory_ownership_diagnostic("解析終了・表示データ保存後")
         _MSM_DIAGNOSTIC.reset(_msm_diag_callback_token)
         report_progress("完了")
 
