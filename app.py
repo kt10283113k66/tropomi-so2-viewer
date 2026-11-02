@@ -9,6 +9,8 @@ from functools import lru_cache
 from datetime import date, datetime, time, timedelta, timezone
 
 import time as time_module
+import contextvars
+import resource
 import folium
 import numpy as np
 import rasterio
@@ -36,6 +38,17 @@ PLUME_THRESHOLD_MOL_M2 = 0.001
 MAX_DIRECTION_DIFFERENCE_DEG = 45.0
 
 VOLCANO_FILE = Path(__file__).resolve().parent / "volcanoes.json"
+
+# 診断専用: Streamlitセッションごとの進捗通知。計算式・数値には影響しない。
+_MSM_DIAGNOSTIC = contextvars.ContextVar("msm_diagnostic", default=None)
+
+def _msm_diag(message):
+    callback = _MSM_DIAGNOSTIC.get()
+    if callback is not None:
+        # Linuxのru_maxrssは最大常駐メモリ(KiB)。現在値ではなくピーク値。
+        peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+        callback(f"MSM-P: {message} / プロセス最大RSS {peak_mb:.0f} MB")
+
 
 
 @st.cache_data(show_spinner=False)
@@ -763,22 +776,31 @@ def download_msm_grib(cycle: datetime) -> Path:
     _MSM_DISK_DIR.mkdir(parents=True, exist_ok=True)
     target = _MSM_DISK_DIR / f"{cycle:%Y%m%d%H}_msm_p.grib2"
     if target.exists() and target.stat().st_size > 1_000_000:
+        _msm_diag(f"{cycle:%m/%d %H}UTC ダウンロード済みファイルを再利用")
         return target
     url = msm_grib_url(cycle)
     part = target.with_suffix(".part")
+    _msm_diag(f"{cycle:%m/%d %H}UTC GRIB2ダウンロード開始")
     try:
         with requests.get(url, stream=True, timeout=(30, 300),
                           headers={"User-Agent": "TROPOMI-SO2-Viewer/2.0"}) as response:
             if response.status_code == 404:
                 raise RuntimeError(f"MSM気圧面GRIB2が見つかりません：{url}")
             response.raise_for_status()
+            total_bytes = 0
+            next_report = 10 * 1024 * 1024
             with part.open("wb") as output:
                 for chunk in response.iter_content(chunk_size=1024 * 1024):
                     if chunk:
                         output.write(chunk)
+                        total_bytes += len(chunk)
+                        if total_bytes >= next_report:
+                            _msm_diag(f"{cycle:%m/%d %H}UTC GRIB2受信 {total_bytes / 1048576:.0f} MiB")
+                            next_report += 10 * 1024 * 1024
         if part.stat().st_size < 1_000_000:
             raise RuntimeError("GRIB2の取得サイズが異常です。")
         part.replace(target)
+        _msm_diag(f"{cycle:%m/%d %H}UTC GRIB2ダウンロード完了")
         # 古いファイルを整理。ディスク使用量を抑える。
         paths = sorted(_MSM_DISK_DIR.glob("*_msm_p.grib2"),
                        key=lambda f: f.stat().st_mtime, reverse=True)
@@ -803,7 +825,9 @@ def _read_grib_fields(path: Path, pressure_level: int, required_steps: tuple):
         import eccodes as ec
     except ImportError as error:
         raise RuntimeError("GRIB2読み込みにはeccodesが必要です。") from error
+    _msm_diag(f"{path.name} {pressure_level}hPa GRIB2走査開始")
     ec.codes_grib_multi_support_on()
+    scanned_messages = 0
     selected = {}
     available = set()
     wanted = {(name, int(step)) for name in ("u", "v", "gh")
@@ -813,6 +837,9 @@ def _read_grib_fields(path: Path, pressure_level: int, required_steps: tuple):
             gid = ec.codes_grib_new_from_file(fh)
             if gid is None:
                 break
+            scanned_messages += 1
+            if scanned_messages % 150 == 0:
+                _msm_diag(f"{pressure_level}hPa GRIB2走査 {scanned_messages}メッセージ")
             try:
                 try:
                     name = str(ec.codes_get(gid, "shortName"))
@@ -855,6 +882,7 @@ def _read_grib_fields(path: Path, pressure_level: int, required_steps: tuple):
                     continue
             finally:
                 ec.codes_release(gid)
+    _msm_diag(f"{pressure_level}hPa GRIB2走査完了 {scanned_messages}メッセージ / 抽出 {len(selected)}場")
     for step in required_steps:
         for name in ("u", "v"):
             if (name, step) not in selected:
@@ -867,6 +895,7 @@ def _read_grib_fields(path: Path, pressure_level: int, required_steps: tuple):
 def _load_cycle_region(cycle: datetime, pressure_level: int,
                        crater_latitude: float, crater_longitude: float):
     """FH0のみを読み込み、火口周辺の小配列をキャッシュする。"""
+    _msm_diag(f"{cycle:%m/%d %H}UTC {pressure_level}hPa 風速場準備開始")
     path = download_msm_grib(cycle)
     fields, lats, lons = _read_grib_fields(path, pressure_level, (0,))
     region = ((lats >= crater_latitude - 1.2) &
@@ -882,6 +911,7 @@ def _load_cycle_region(cycle: datetime, pressure_level: int,
     lon_grid = lons[r0:r1, c0:c1].copy()
     small = {key: arr[r0:r1, c0:c1].copy() for key, arr in fields.items()}
     x_grid, y_grid = local_xy_m(lat_grid, lon_grid, crater_latitude, crater_longitude)
+    _msm_diag(f"{cycle:%m/%d %H}UTC {pressure_level}hPa 領域切出し完了")
     return small, lat_grid, lon_grid, x_grid, y_grid
 
 
@@ -956,12 +986,16 @@ def build_time_varying_msm_field(end_utc: datetime, pressure_level: int,
     start_utc = end_utc - timedelta(hours=MODEL_LOOKBACK_HOURS)
     first_valid = start_utc.replace(minute=0, second=0, microsecond=0)
     fields = []
+    _msm_diag(f"{pressure_level}hPa 過去{MODEL_LOOKBACK_HOURS}時間の風速場構築開始")
     for hour_offset in range(MODEL_LOOKBACK_HOURS + 1):
         valid_time = first_valid + timedelta(hours=hour_offset)
+        _msm_diag(f"{pressure_level}hPa {valid_time:%m/%d %H}UTC 風速場取得開始 ({hour_offset+1}/{MODEL_LOOKBACK_HOURS+1})")
         field = fetch_msm_p_field(valid_time.date(), valid_time.hour,
                     pressure_level, crater_latitude, crater_longitude)
         fields.append({"valid_time": valid_time, "field": field})
+        _msm_diag(f"{pressure_level}hPa {valid_time:%m/%d %H}UTC 風速場取得完了 ({hour_offset+1}/{MODEL_LOOKBACK_HOURS+1})")
     # 終了時刻の風を代表値とし、既存の表示項目・手動フィッティングとの互換性を維持。
+    _msm_diag(f"{pressure_level}hPa 過去5時間の風速場構築完了")
     result = dict(fields[-1]["field"])
     result["time_slices"] = fields
     result["model_start_utc"] = start_utc
@@ -2501,6 +2535,7 @@ if run:
             # データ取得・モデル計算の経路から除外。保存要求時のみ生成する。
             so2_map_png, so2_map_tile_error = None, None
             report_progress("ピーク解析完了・モデル計算へ")
+            _MSM_DIAGNOSTIC.set(report_progress)
 
             tropomi_resolution = {
                 "ns_km": float(model_resolution_ns_km),
@@ -2524,6 +2559,7 @@ if run:
                 # 自動ピークの有無にかかわらずMSM-P風場は取得する。
                 # これにより、自動検出失敗時でも後から任意地点で
                 # 手動フィッティングできる。
+                report_progress(f"MSM-P候補計算開始（{len(selected_jst_hours)}時刻 × {len(selected_pressure_levels)}気圧面）")
                 for jst_hour in sorted(selected_jst_hours):
                     # 選択日JSTからUTC日時へ変換する。
                     jst_datetime = datetime.combine(
@@ -2539,11 +2575,13 @@ if run:
                         reverse=True,
                     ):
                         try:
+                            report_progress(f"MSM-P {jst_hour:02d} JST / {pressure_level}hPa 取得開始")
                             candidate_field = build_time_varying_msm_field(
                                 utc_datetime, pressure_level,
                                 crater_lat, crater_lon,
                             )
 
+                            report_progress(f"MSM-P {jst_hour:02d} JST / {pressure_level}hPa 取得完了")
                             candidate_emission_height_m = float(
                                 manual_emission_height_m
                             )
@@ -2583,6 +2621,7 @@ if run:
 
                             # 自動ピークが存在する場合だけ、自動モデル計算を行う。
                             if maximum is not None:
+                                report_progress(f"モデル計算開始 {jst_hour:02d} JST / {pressure_level}hPa")
                                 candidate_result = calculate_quasi_steady_model(
                                     msm_field=candidate_field,
                                     crater_latitude=crater_lat,
@@ -2601,12 +2640,14 @@ if run:
                                     target_ns_km=float(model_resolution_ns_km),
                                     target_ew_km=float(model_resolution_ew_km),
                                 )
+                                report_progress(f"モデル濃度場計算完了 {jst_hour:02d} JST / {pressure_level}hPa・フィッティング中")
                                 candidate_result = add_peak_fitting_diagnostics(
                                     candidate_result,
                                     maximum,
                                     emission_rate_t_day,
                                 )
 
+                                report_progress(f"モデル候補完了 {jst_hour:02d} JST / {pressure_level}hPa")
                                 model_candidates.append(
                                     {
                                         **field_candidate,
@@ -2614,6 +2655,7 @@ if run:
                                     }
                                 )
                         except Exception as error:
+                            report_progress(f"候補エラー {jst_hour:02d} JST / {pressure_level}hPa: {type(error).__name__}: {str(error)[:180]}")
                             model_candidate_errors.append(
                                 {
                                     "jst_hour": int(jst_hour),
@@ -2638,6 +2680,7 @@ if run:
                             "MSM-P風場の取得にも失敗しました。"
                         )
                 elif model_candidates:
+                    report_progress("全候補計算完了・最適候補選択中")
                     optimal_candidate, optimal_selection_reason = (
                         choose_optimal_candidate(model_candidates)
                     )
@@ -2656,6 +2699,7 @@ if run:
                         "モデル計算に失敗しました。"
                     )
 
+        _MSM_DIAGNOSTIC.set(None)
         report_progress("解析完了・表示用データを保存中")
         st.session_state["viewer"] = {
             "so2_png": so2_png,
