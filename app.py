@@ -1062,7 +1062,7 @@ def _read_grib_fields_levels(path: Path, pressure_levels: tuple):
                 ec.codes_release(gid)
             if scanned % 150 == 0:
                 _msm_diag(f"一括GRIB2走査 {scanned}メッセージ")
-    _grib_memory_checkpoint("一括GRIB走査直後", selected=selected)
+    _grib_memory_checkpoint("一括GRIB走査直後・全GRIBハンドルrelease済", selected=selected)
     _msm_diag(f"一括GRIB2走査完了 {scanned}メッセージ / {len(selected)}場")
     for level in levels:
         for name in ("u", "v"):
@@ -1099,6 +1099,15 @@ def _load_cycle_regions(cycle: datetime, pressure_levels: tuple,
         x_grid, y_grid = local_xy_m(lat_grid, lon_grid, crater_latitude, crater_longitude)
         result[level] = (small, lat_grid, lon_grid, x_grid, y_grid)
     _grib_memory_checkpoint("領域切出し後・一時配列保持中", all_fields=all_fields)
+    # ここからは火口周辺をcopy()したresultだけを使用する。
+    # 全領域の一時配列への参照を明示的に外し、GCの前後でRSSを比較する。
+    # result、風速値、時刻内挿、フィッティングには変更を加えない。
+    del all_fields, grids
+    del lats, lons, lat_grid, lon_grid, small, x_grid, y_grid, region, rows, cols
+    _grib_memory_checkpoint("全領域一時配列参照解放後・GC前")
+    collected = gc.collect()
+    _msm_diag(f"GRIB解放診断: gc.collect()回収={collected}オブジェクト")
+    _grib_memory_checkpoint("全領域一時配列参照解放後・GC後")
     _msm_diag(f"{cycle:%m/%d %H}UTC {pressure_levels}hPa 領域切出し完了")
     return result
 
