@@ -1078,36 +1078,42 @@ def _load_cycle_regions(cycle: datetime, pressure_levels: tuple,
     _grib_memory_checkpoint("サイクル読み込み前")
     path = download_msm_grib(cycle)
     _grib_memory_checkpoint("GRIBダウンロード/再利用後")
-    all_fields, grids = _read_grib_fields_levels(path, pressure_levels)
-    _grib_memory_checkpoint("抽出後・領域切出し前", all_fields=all_fields)
-    result = {}
-    for level in pressure_levels:
-        lats, lons = grids[level]
-        region = ((lats >= crater_latitude - 1.2) &
-                  (lats <= crater_latitude + 1.2) &
-                  (lons >= crater_longitude - 1.5) &
-                  (lons <= crater_longitude + 1.5))
-        if not np.any(region):
-            raise RuntimeError(f"{level}hPa: 火口周辺にMSMの格子点がありません。")
-        rows, cols = np.where(region)
-        r0, r1 = int(rows.min()), int(rows.max()) + 1
-        c0, c1 = int(cols.min()), int(cols.max()) + 1
-        lat_grid = lats[r0:r1, c0:c1].copy()
-        lon_grid = lons[r0:r1, c0:c1].copy()
-        small = {(name, 0): all_fields[(level, name)][r0:r1, c0:c1].copy()
-                 for name in ("u", "v", "gh") if (level, name) in all_fields}
-        x_grid, y_grid = local_xy_m(lat_grid, lon_grid, crater_latitude, crater_longitude)
-        result[level] = (small, lat_grid, lon_grid, x_grid, y_grid)
-    _grib_memory_checkpoint("領域切出し後・一時配列保持中", all_fields=all_fields)
-    # ここからは火口周辺をcopy()したresultだけを使用する。
-    # 全領域の一時配列への参照を明示的に外し、GCの前後でRSSを比較する。
-    # result、風速値、時刻内挿、フィッティングには変更を加えない。
-    del all_fields, grids
-    del lats, lons, lat_grid, lon_grid, small, x_grid, y_grid, region, rows, cols
-    _grib_memory_checkpoint("全領域一時配列参照解放後・GC前")
-    collected = gc.collect()
-    _msm_diag(f"GRIB解放診断: gc.collect()回収={collected}オブジェクト")
-    _grib_memory_checkpoint("全領域一時配列参照解放後・GC後")
+    # ecCodes decoding is isolated in a short-lived subprocess. Its native
+    # allocations are reclaimed by the OS when the worker exits.
+    import subprocess
+    worker_path = Path(__file__).resolve().with_name("grib_region_worker.py")
+    if not worker_path.is_file():
+        raise RuntimeError(f"GRIB2子プロセス用スクリプトがありません: {worker_path}")
+    with tempfile.TemporaryDirectory(prefix="msm_grib_region_") as temporary:
+        output = Path(temporary) / "regions.npz"
+        command = [sys.executable, str(worker_path),
+                   "--input", str(path), "--output", str(output),
+                   "--levels", ",".join(str(int(v)) for v in pressure_levels),
+                   "--lat", repr(float(crater_latitude)),
+                   "--lon", repr(float(crater_longitude))]
+        _msm_diag(f"{path.name} GRIB2子プロセス開始")
+        _grib_memory_checkpoint("GRIB子プロセス起動前")
+        try:
+            completed = subprocess.run(command, capture_output=True, text=True,
+                                       timeout=180, check=False)
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError("GRIB2子プロセスが180秒以内に完了しませんでした。") from error
+        if completed.returncode != 0:
+            raise RuntimeError("GRIB2子プロセスが失敗しました: " +
+                               (completed.stderr or completed.stdout)[-3000:])
+        _grib_memory_checkpoint("GRIB子プロセス終了後・親プロセス")
+        result = {}
+        with np.load(output, allow_pickle=False) as archive:
+            for level in pressure_levels:
+                lat_grid = archive[f"{level}_lat"].copy()
+                lon_grid = archive[f"{level}_lon"].copy()
+                small = {(name, 0): archive[f"{level}_{name}"].copy()
+                         for name in ("u", "v", "gh")
+                         if f"{level}_{name}" in archive.files}
+                x_grid, y_grid = local_xy_m(lat_grid, lon_grid,
+                                            crater_latitude, crater_longitude)
+                result[level] = (small, lat_grid, lon_grid, x_grid, y_grid)
+    _grib_memory_checkpoint("子プロセス領域配列受信後・親プロセス")
     _msm_diag(f"{cycle:%m/%d %H}UTC {pressure_levels}hPa 領域切出し完了")
     return result
 
