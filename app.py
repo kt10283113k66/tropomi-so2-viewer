@@ -2459,10 +2459,20 @@ if run:
         with st.spinner(
             "SO₂画像・数値データ・雲量を取得しています…"
         ):
+            progress_status = st.empty()
+            progress_start = time_module.monotonic()
+
+            def report_progress(message):
+                elapsed = time_module.monotonic() - progress_start
+                progress_status.info(f"TROPOMI取得: {message}（経過 {elapsed:.1f} 秒）")
+                print(f"[TROPOMI] {elapsed:.1f}s {message}", flush=True)
+
+            report_progress("CDSE認証中")
             token = get_access_token(
                 client_id,
                 client_secret,
             )
+            report_progress("CDSE認証完了・SO₂画像取得中 (1/5)")
 
             so2_png = request_process(
                 token=token,
@@ -2474,6 +2484,7 @@ if run:
                 mime_type="image/png",
             )
 
+            report_progress("SO₂画像取得完了・SO₂数値取得中 (2/5)")
             # 表示・クリック値取得用の高解像度格子。
             so2_tiff = request_process(
                 token=token,
@@ -2485,6 +2496,7 @@ if run:
                 mime_type="image/tiff",
             )
 
+            report_progress("SO₂数値取得完了・連結判定データ取得中 (3/5)")
             # 連結判定は表示用768×768等では行わない。
             # 約3.5 km（南北）×7 km（東西）のTROPOMI相当格子を
             # 別途取得し、元画素相当のピクセル数を数える。
@@ -2505,6 +2517,7 @@ if run:
                 mime_type="image/tiff",
             )
 
+            report_progress("連結判定データ取得完了・雲量画像取得中 (4/5)")
             cloud_png = request_process(
                 token=token,
                 bbox=bbox,
@@ -2515,6 +2528,7 @@ if run:
                 mime_type="image/png",
             )
 
+            report_progress("雲量画像取得完了・雲量数値取得中 (5/5)")
             cloud_tiff = request_process(
                 token=token,
                 bbox=bbox,
@@ -2525,11 +2539,13 @@ if run:
                 mime_type="image/tiff",
             )
 
+            report_progress("全データ取得完了・GeoTIFF展開中")
             so2_array, so2_transform = read_float_tiff(so2_tiff)
             plume_detection_array, plume_detection_transform = read_float_tiff(
                 plume_detection_tiff
             )
             cloud_array, cloud_transform = read_float_tiff(cloud_tiff)
+            report_progress("GeoTIFF展開完了・解析処理中")
             if cloud_array.shape != so2_array.shape:
                 raise RuntimeError("SO₂と雲量の格子形状が一致しません。")
 
