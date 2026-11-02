@@ -921,15 +921,12 @@ def _read_grib_fields(path: Path, pressure_level: int, required_steps: tuple):
     return selected, lats, lons
 
 
-@lru_cache(maxsize=4)
+@lru_cache(maxsize=6)
 def _load_cycle_region(cycle: datetime, pressure_level: int,
                        crater_latitude: float, crater_longitude: float):
-    """同じ初期値・気圧面のGRIB2は1回だけ走査する（LRU最大4組）。
-
-    FH0/FH3を一括抽出し、キャッシュには火口周辺の小配列だけを保持する。
-    """
+    """FH0のみを読み込み、火口周辺の小配列をキャッシュする。"""
     path = download_msm_grib(cycle)
-    fields, lats, lons = _read_grib_fields(path, pressure_level, (0, 3))
+    fields, lats, lons = _read_grib_fields(path, pressure_level, (0,))
     region = ((lats >= crater_latitude - 1.2) &
               (lats <= crater_latitude + 1.2) &
               (lons >= crater_longitude - 1.5) &
@@ -949,29 +946,41 @@ def _load_cycle_region(cycle: datetime, pressure_level: int,
 @st.cache_data(show_spinner=False, ttl=3600, max_entries=12)
 def fetch_msm_p_field(target_date: date, utc_hour: int, pressure_level: int,
                       crater_latitude: float, crater_longitude: float):
-    """既存と同じFH0/FH3線形内挿。初期値ごとの重複GRIB走査を排除。"""
+    """前後の3時間毎のFH0（解析初期値）だけから正時風速場を線形内挿する。"""
     valid_utc = datetime.combine(target_date, time(hour=int(utc_hour)))
-    cycle, step = msm_cycle_and_step(valid_utc)
+    cycle0, step = msm_cycle_and_step(valid_utc)
+    cycle1 = cycle0 + timedelta(hours=3) if step else None
     try:
-        fields, lat_grid, lon_grid, x_grid, y_grid = _load_cycle_region(
-            cycle, pressure_level, crater_latitude, crater_longitude)
+        fields0, lat_grid, lon_grid, x_grid, y_grid = _load_cycle_region(
+            cycle0, pressure_level, crater_latitude, crater_longitude)
+        fields1 = None
+        if cycle1 is not None:
+            fields1, lat1, lon1, _, _ = _load_cycle_region(
+                cycle1, pressure_level, crater_latitude, crater_longitude)
+            if (lat_grid.shape != lat1.shape or lon_grid.shape != lon1.shape or
+                    not np.allclose(lat_grid, lat1, atol=1e-5, rtol=0) or
+                    not np.allclose(lon_grid, lon1, atol=1e-5, rtol=0)):
+                raise RuntimeError("前後のFH0の格子が一致しないため、時間内挿できません。")
     except (RuntimeError, OSError, ValueError) as error:
+        source = f"{cycle0:%Y-%m-%d %H}UTC"
+        if cycle1 is not None:
+            source += f"・{cycle1:%Y-%m-%d %H}UTC"
         raise RuntimeError(
             f"{valid_utc:%Y-%m-%d %H}UTC・{pressure_level}hPaの風速場取得に失敗。"
-            f"初期時刻{cycle:%Y-%m-%d %H}UTC：{error}"
+            f"必要なFH0初期時刻：{source}：{error}"
         ) from error
 
     def field_value(name):
-        f0 = fields.get((name, 0))
-        if f0 is None:
+        first = fields0.get((name, 0))
+        if first is None:
             return None
-        if step == 0:
-            return f0.copy()
-        f3 = fields.get((name, 3))
-        if f3 is None:
+        if fields1 is None:
+            return first.copy()
+        second = fields1.get((name, 0))
+        if second is None:
             return None
-        return ((1.0 - step / 3.0) * f0 +
-                (step / 3.0) * f3).astype(np.float32)
+        weight = step / 3.0
+        return ((1.0 - weight) * first + weight * second).astype(np.float32)
 
     u, v, height = field_value("u"), field_value("v"), field_value("gh")
     valid = np.isfinite(u) & np.isfinite(v)
@@ -988,11 +997,14 @@ def fetch_msm_p_field(target_date: date, utc_hour: int, pressure_level: int,
             "u_ms": u, "v_ms": v, "valid": valid,
             "analysis_time": valid_utc.strftime("%Y-%m-%d %H:%M UTC"),
             "utc_hour": valid_utc.hour, "pressure_level": int(pressure_level),
-            "source_url": msm_grib_url(cycle),
-            "forecast_cycle_utc": cycle.strftime("%Y-%m-%d %H:%M UTC"),
-            "forecast_hour": step,
-            "temporal_interpolation": ("linear_FH0_FH3" if step else "none"),
-            "source_forecast_hours": ([0, 3] if step else [0]),
+            "source_url": msm_grib_url(cycle0),
+            "source_urls": [msm_grib_url(cycle0)] + ([msm_grib_url(cycle1)] if cycle1 else []),
+            "forecast_cycle_utc": cycle0.strftime("%Y-%m-%d %H:%M UTC"),
+            "forecast_hour": 0,
+            "temporal_interpolation": ("linear_between_FH0_analyses" if step else "none"),
+            "source_forecast_hours": [0],
+            "source_analysis_times": [cycle0.strftime("%Y-%m-%d %H:%M UTC")] +
+                ([cycle1.strftime("%Y-%m-%d %H:%M UTC")] if cycle1 else []),
             "geopotential_height_m": geopotential_height}
 
 
