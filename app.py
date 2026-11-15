@@ -3,10 +3,17 @@ import json
 import math
 import os
 import tempfile
+from bisect import bisect_right
 from pathlib import Path
+from functools import lru_cache
 from datetime import date, datetime, time, timedelta, timezone
 
 import time as time_module
+import contextvars
+import gc
+import sys
+import resource
+import tracemalloc
 import folium
 import numpy as np
 import rasterio
@@ -14,7 +21,6 @@ import requests
 import streamlit as st
 import xarray as xr
 from scipy.spatial import cKDTree
-from scipy.ndimage import label as connected_component_label
 from branca.element import Element
 from folium.plugins import Fullscreen, MousePosition
 from PIL import Image, ImageDraw
@@ -28,12 +34,132 @@ TOKEN_URL = (
 )
 PROCESS_URL = "https://sh.dataspace.copernicus.eu/api/v1/process"
 MSM_P_BASE_URL = "https://database.rish.kyoto-u.ac.jp/arch/jmadata/data/gpv/original"
+MODEL_LOOKBACK_HOURS = 5
+MODEL_TIME_STEP_MINUTES = 5
 SO2_MOLAR_MASS_KG_MOL = 0.064066
 PLUME_THRESHOLD_MOL_M2 = 0.001
-MIN_CONNECTED_PLUME_PIXELS = 3
 MAX_DIRECTION_DIFFERENCE_DEG = 45.0
 
 VOLCANO_FILE = Path(__file__).resolve().parent / "volcanoes.json"
+
+# 診断専用: Streamlitセッションごとの進捗通知。計算式・数値には影響しない。
+_MSM_DIAGNOSTIC = contextvars.ContextVar("msm_diagnostic", default=None)
+_MSM_ACTIVE_LEVELS = contextvars.ContextVar("msm_active_levels", default=(900, 850, 800))
+
+def _msm_diag(message):
+    callback = _MSM_DIAGNOSTIC.get()
+    if callback is not None:
+        # Linuxのru_maxrssは最大常駐メモリ(KiB)。現在値ではなくピーク値。
+        peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+        # /proc/self/statmのresidentは現在RSS。最大RSSと区別する。
+        try:
+            with open("/proc/self/statm", "r", encoding="ascii") as statm:
+                resident_pages = int(statm.read().split()[1])
+            current_mb = resident_pages * os.sysconf("SC_PAGE_SIZE") / 1048576
+            memory_note = f"現在RSS {current_mb:.0f} MB / 最大RSS {peak_mb:.0f} MB"
+        except (OSError, ValueError, IndexError):
+            memory_note = f"最大RSS {peak_mb:.0f} MB"
+        callback(f"MSM-P: {message} / {memory_note}")
+
+
+
+def _grib_memory_checkpoint(stage: str, **objects):
+    """診断専用。RSS、Python追跡割当、指定配列の実データ容量を記録。"""
+    try:
+        with open("/proc/self/statm", "r", encoding="ascii") as fh:
+            resident = int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1048576
+        current, peak = tracemalloc.get_traced_memory() if tracemalloc.is_tracing() else (0, 0)
+        detail = []
+        for name, obj in objects.items():
+            if isinstance(obj, dict):
+                arrays = [v for v in obj.values() if isinstance(v, np.ndarray)]
+                size = sum(v.nbytes for v in arrays)
+                detail.append(f"{name}={len(arrays)}配列/{size/1048576:.1f}MiB")
+            elif isinstance(obj, np.ndarray):
+                detail.append(f"{name}={obj.nbytes/1048576:.1f}MiB")
+        _msm_diag(f"GRIBメモリ詳細 [{stage}] RSS={resident:.1f}MiB, "
+                  f"tracemalloc現在={current/1048576:.1f}MiB/ピーク={peak/1048576:.1f}MiB; "
+                  + ", ".join(detail))
+    except Exception as exc:
+        _msm_diag(f"GRIBメモリ詳細 [{stage}] 診断失敗: {type(exc).__name__}: {exc}")
+
+
+def _msm_cache_diagnostic(stage: str):
+    """診断ログのみ。キャッシュの削除・更新や解析値の変更は行わない。"""
+    info = _load_cycle_regions.cache_info()
+    _msm_diag(
+        f"キャッシュ診断 [{stage}] "
+        f"GRIB領域LRU hits={info.hits}, misses={info.misses}, "
+        f"保持={info.currsize}/{info.maxsize}; " + ("正時風速Streamlit cache_data TTL=3600秒, max_entries=12 "
+         "(実保持件数は公開APIで取得不可)"
+         if MSM_HOURLY_STREAMLIT_CACHE_ENABLED else
+         "正時風速Streamlit cache_data=無効（比較実験）")
+    )
+
+
+
+def _approx_retained_size(value, seen=None, depth=0):
+    """診断専用: 到達可能なPython/NumPyオブジェクトの概算サイズ。"""
+    if seen is None:
+        seen = set()
+    identity = id(value)
+    if identity in seen or depth > 12:
+        return 0
+    seen.add(identity)
+    if isinstance(value, np.ndarray):
+        # viewが共有する基底配列は重複計上しないようにする。
+        root = value
+        while isinstance(getattr(root, "base", None), np.ndarray):
+            root = root.base
+        root_id = id(root)
+        if root_id in seen and root_id != identity:
+            return 0
+        seen.add(root_id)
+        return int(root.nbytes) + sys.getsizeof(value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return sys.getsizeof(value)
+    if isinstance(value, dict):
+        return sys.getsizeof(value) + sum(
+            _approx_retained_size(k, seen, depth + 1) +
+            _approx_retained_size(v, seen, depth + 1)
+            for k, v in value.items()
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return sys.getsizeof(value) + sum(
+            _approx_retained_size(v, seen, depth + 1) for v in value
+        )
+    # pandas等の任意オブジェクトを深掘りしない（診断で副作用を起こさない）。
+    try:
+        return sys.getsizeof(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _memory_ownership_diagnostic(stage: str):
+    """キャッシュ・GC・セッション保持量を非破壊で記録する。"""
+    try:
+        # gc.collect()は呼ばず、現在の統計のみ参照する。
+        counts = gc.get_count()
+        stats = gc.get_stats()
+        tracked = len(gc.get_objects())
+        tracked_arrays = sum(isinstance(obj, np.ndarray) for obj in gc.get_objects())
+        session = dict(st.session_state)
+        per_key = sorted(
+            ((str(key), _approx_retained_size(value)) for key, value in session.items()),
+            key=lambda pair: pair[1], reverse=True,
+        )
+        total = sum(size for _, size in per_key)
+        top = ", ".join(f"{key}={size/1048576:.1f}MiB" for key, size in per_key[:6])
+        _msm_diag(
+            f"メモリ内訳 [{stage}] session_state概算={total/1048576:.1f}MiB "
+            f"({len(session)}キー; {top}); GC追跡={tracked}個 "
+            f"(うちndarray={tracked_arrays}個), GC世代カウント={counts}, "
+            f"累積回収={tuple(item['collected'] for item in stats)}; " + ("Streamlit cache_data実保持容量は公開APIから取得不可"
+             if MSM_HOURLY_STREAMLIT_CACHE_ENABLED else
+             "正時風速Streamlit cache_data=無効（比較実験）")
+        )
+    except Exception as exc:
+        _msm_diag(f"メモリ内訳 [{stage}] 診断失敗: {type(exc).__name__}: {exc}")
 
 
 @st.cache_data(show_spinner=False)
@@ -511,7 +637,7 @@ def request_process_rectangular(
         )
     if not response.ok:
         raise RuntimeError(
-            f"連結判定用データ取得に失敗しました（HTTP {response.status_code}）。\n"
+            f"ピーク判定用データ取得に失敗しました（HTTP {response.status_code}）。\n"
             f"{response.text[:1000]}"
         )
     return response.content
@@ -523,7 +649,7 @@ def plume_detection_grid_size(
     target_ns_km: float = 5.5,
     target_ew_km: float = 3.5,
 ) -> tuple[int, int]:
-    """TROPOMI相当の物理分解能から連結判定用の幅・高さを求める。"""
+    """TROPOMI相当の物理分解能からピーク判定用の幅・高さを求める。"""
     north_south_km = abs(bbox[3] - bbox[1]) * 111.32
     east_west_km = (
         abs(bbox[2] - bbox[0])
@@ -615,13 +741,9 @@ def find_annulus_maximum(
     min_distance_km: float = 10.0,
     max_distance_km: float = 30.0,
     threshold_mol_m2: float = PLUME_THRESHOLD_MOL_M2,
-    min_connected_pixels: int = MIN_CONNECTED_PLUME_PIXELS,
 ):
     """
-    10～30 km環状帯で、閾値以上の8近傍連結成分を抽出する。
-
-    3画素以上が辺または角で隣接する成分だけをプルーム候補とし、
-    候補成分内で最も高いSO₂カラム濃度をピークとして返す。
+    10～30 km環状帯の閾値以上の画素から最大濃度を返す。
     """
     rows, cols = np.indices(array.shape)
 
@@ -651,72 +773,20 @@ def find_annulus_maximum(
     if not np.any(plume_mask):
         return None
 
-    # 8近傍（上下左右＋斜め）で連結成分を判定する。
-    structure = np.ones((3, 3), dtype=np.uint8)
-    labels, component_count = connected_component_label(
-        plume_mask,
-        structure=structure,
-    )
-
-    valid_components = []
-    for component_id in range(1, component_count + 1):
-        component_mask = labels == component_id
-        pixel_count = int(np.count_nonzero(component_mask))
-
-        if pixel_count < int(min_connected_pixels):
-            continue
-
-        component_values = np.where(
-            component_mask,
-            array,
-            -np.inf,
-        )
-        flat_index = int(np.argmax(component_values))
-        row, col = np.unravel_index(
-            flat_index,
-            component_values.shape,
-        )
-
-        valid_components.append(
-            {
-                "row": int(row),
-                "col": int(col),
-                "pixel_count": pixel_count,
-                "peak_value": float(array[row, col]),
-            }
-        )
-
-    if not valid_components:
-        return None
-
-    selected = max(
-        valid_components,
-        key=lambda item: item["peak_value"],
-    )
-    row = selected["row"]
-    col = selected["col"]
-
+    # 連結成分の判定は行わず、環状帯内の閾値以上の最大画素を採用する。
+    # 画素格子は従来のTROPOMI相当の粗い判定格子を維持する。
+    candidate_values = np.where(plume_mask, array, -np.inf)
+    flat_index = int(np.argmax(candidate_values))
+    row, col = np.unravel_index(flat_index, array.shape)
     max_lat = float(latitudes[row, col])
     max_lon = float(longitudes[row, col])
-
     return {
         "value": float(array[row, col]),
         "latitude": max_lat,
         "longitude": max_lon,
         "distance_km": float(distances[row, col]),
-        "bearing_deg": bearing_deg(
-            crater_lat,
-            crater_lon,
-            max_lat,
-            max_lon,
-        ),
-        "connected_pixel_count": int(
-            selected["pixel_count"]
-        ),
+        "bearing_deg": bearing_deg(crater_lat, crater_lon, max_lat, max_lon),
         "threshold_mol_m2": float(threshold_mol_m2),
-        "minimum_connected_pixels": int(
-            min_connected_pixels
-        ),
     }
 
 
@@ -793,6 +863,12 @@ def xy_to_latlon(x_m, y_m, origin_latitude, origin_longitude):
     return latitude, longitude
 
 
+def msm_cycle_and_step(valid_utc: datetime) -> tuple[datetime, int]:
+    """有効時刻に対応する直近の3時間毎の初期時刻と予報時間。"""
+    cycle = valid_utc.replace(hour=(valid_utc.hour // 3) * 3, minute=0, second=0, microsecond=0)
+    return cycle, int((valid_utc - cycle).total_seconds() // 3600)
+
+
 def msm_grib_url(cycle: datetime) -> str:
     filename = (
         f"Z__C_RJTD_{cycle:%Y%m%d%H}0000_MSM_GPV_Rjp_L-pall_"
@@ -801,203 +877,361 @@ def msm_grib_url(cycle: datetime) -> str:
     return f"{MSM_P_BASE_URL}/{cycle:%Y/%m/%d}/{filename}"
 
 
-@st.cache_data(show_spinner=False, ttl=86400, max_entries=16)
-def download_msm_grib(cycle: datetime) -> bytes:
-    """GRIB2を自動取得。Streamlitキャッシュにより同じ初期値は再取得しない。"""
+# GRIB2は約50MB/ファイル。bytesをStreamlitのメモリキャッシュに保持しない。
+# プロセス内の一時ディスクに最大8初期値だけ保存し、再取得を減らす。
+_MSM_DISK_DIR = Path(tempfile.gettempdir()) / "tropomi_msm_grib2"
+
+
+def download_msm_grib(cycle: datetime) -> Path:
+    """GRIB2をディスクへストリーミング保存し、Pathだけ返す。"""
+    _MSM_DISK_DIR.mkdir(parents=True, exist_ok=True)
+    target = _MSM_DISK_DIR / f"{cycle:%Y%m%d%H}_msm_p.grib2"
+    if target.exists() and target.stat().st_size > 1_000_000:
+        _msm_diag(f"{cycle:%m/%d %H}UTC ダウンロード済みファイルを再利用")
+        return target
     url = msm_grib_url(cycle)
+    part = target.with_suffix(".part")
+    _msm_diag(f"{cycle:%m/%d %H}UTC GRIB2ダウンロード開始")
     try:
         with requests.get(url, stream=True, timeout=(30, 300),
                           headers={"User-Agent": "TROPOMI-SO2-Viewer/2.0"}) as response:
             if response.status_code == 404:
                 raise RuntimeError(f"MSM気圧面GRIB2が見つかりません：{url}")
             response.raise_for_status()
-            buffer = io.BytesIO()
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    buffer.write(chunk)
-            payload = buffer.getvalue()
-            if not payload.startswith(b"GRIB"):
-                raise RuntimeError(f"GRIB2形式ではない応答を受信しました：{url}")
-            return payload
+            total_bytes = 0
+            next_report = 10 * 1024 * 1024
+            with part.open("wb") as output:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        output.write(chunk)
+                        total_bytes += len(chunk)
+                        if total_bytes >= next_report:
+                            _msm_diag(f"{cycle:%m/%d %H}UTC GRIB2受信 {total_bytes / 1048576:.0f} MiB")
+                            next_report += 10 * 1024 * 1024
+        if part.stat().st_size < 1_000_000:
+            raise RuntimeError("GRIB2の取得サイズが異常です。")
+        part.replace(target)
+        _msm_diag(f"{cycle:%m/%d %H}UTC GRIB2ダウンロード完了")
+        # 古いファイルを整理。ディスク使用量を抑える。
+        paths = sorted(_MSM_DISK_DIR.glob("*_msm_p.grib2"),
+                       key=lambda f: f.stat().st_mtime, reverse=True)
+        for old in paths[8:]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        return target
     except requests.RequestException as error:
         raise RuntimeError(f"MSM GRIB2取得エラー（{url}）：{error}") from error
+    finally:
+        try:
+            part.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
-def _read_grib_component(path: Path, short_name: str, step: int,
-                         pressure_level: int):
-    """ecCodesでGRIBメッセージを直接選択する（cfgribの座標結合に依存しない）。"""
+def _read_grib_fields(path: Path, pressure_level: int, required_steps: tuple):
+    """1回のGRIB走査で必要な気圧面・FH・u/v/ghだけ展開する。"""
     try:
         import eccodes as ec
     except ImportError as error:
-        raise RuntimeError(
-            "GRIB2読み込みにはeccodesが必要です。requirements_msm_grib2.txtを確認してください。"
-        ) from error
-
-    # JMA MSM-Pは1つのGRIB2メッセージ内に多数の場を格納する
-    # multi-field GRIB2形式。ecCodesはデフォルトでは先頭の場しか
-    # 返さないため、必ずmulti-field supportを有効化する。
-    # 無効のままだと先頭の高度場だけが見え、u/vのFH一覧が[]になる。
-    try:
-        ec.codes_grib_multi_support_on()
-    except AttributeError as error:
-        raise RuntimeError(
-            "使用中のeccodesがmulti-field GRIB2の読み込みに対応していません。"
-            "eccodesを更新してください。"
-        ) from error
-
+        raise RuntimeError("GRIB2読み込みにはeccodesが必要です。") from error
+    _msm_diag(f"{path.name} {pressure_level}hPa GRIB2走査開始")
+    ec.codes_grib_multi_support_on()
+    scanned_messages = 0
+    selected = {}
     available = set()
+    wanted = {(name, int(step)) for name in ("u", "v", "gh")
+              for step in required_steps}
     with path.open("rb") as fh:
         while True:
             gid = ec.codes_grib_new_from_file(fh)
             if gid is None:
                 break
+            scanned_messages += 1
+            if scanned_messages % 150 == 0:
+                _msm_diag(f"{pressure_level}hPa GRIB2走査 {scanned_messages}メッセージ")
             try:
                 try:
                     name = str(ec.codes_get(gid, "shortName"))
+                    if name not in ("u", "v", "gh"):
+                        continue
                     level_type = str(ec.codes_get(gid, "typeOfLevel"))
+                    if level_type not in ("isobaricInhPa", "isobaricInPa"):
+                        continue
                     level = float(ec.codes_get(gid, "level"))
-                    # forecastTimeはGRIB2の時間単位に依存するため、stepUnitsを時間に正規化。
+                    level_hpa = level / 100 if level_type == "isobaricInPa" else level
+                    if abs(level_hpa - pressure_level) > 0.01:
+                        continue
                     step_hours = float(ec.codes_get(gid, "endStep", ktype=float))
-                    step_units = str(ec.codes_get(gid, "stepUnits"))
-                    if step_units in ("m", "min"):
-                        step_hours /= 60.0
-                    elif step_units in ("s", "sec"):
-                        step_hours /= 3600.0
-                    elif step_units in ("d", "day"):
-                        step_hours *= 24.0
-                except Exception:
-                    continue
-                if name != short_name or level_type not in ("isobaricInhPa", "isobaricInPa"):
-                    continue
-                level_hpa = level / 100.0 if level_type == "isobaricInPa" else level
-                if abs(level_hpa - pressure_level) > 0.01:
-                    continue
-                available.add(round(step_hours, 4))
-                if abs(step_hours - step) > 1e-6:
-                    continue
-                values = np.asarray(ec.codes_get_array(gid, "values"), dtype=float)
-                lats = np.asarray(ec.codes_get_array(gid, "latitudes"), dtype=float)
-                lons = np.asarray(ec.codes_get_array(gid, "longitudes"), dtype=float)
-                try:
-                    nj = int(ec.codes_get(gid, "Nj"))
+                    units = str(ec.codes_get(gid, "stepUnits"))
+                    if units in ("m", "min"):
+                        step_hours /= 60
+                    elif units in ("s", "sec"):
+                        step_hours /= 3600
+                    elif units in ("d", "day"):
+                        step_hours *= 24
+                    available.add((name, round(step_hours, 3)))
+                    step = round(step_hours)
+                    if abs(step_hours - step) > 1e-6 or (name, step) not in wanted:
+                        continue
+                    if (name, step) in selected:
+                        continue
+                    # 配列展開は、必要な場に限る。緯度経度は最初の場だけ取得。
                     ni = int(ec.codes_get(gid, "Ni"))
-                except Exception:
-                    nj = int(ec.codes_get(gid, "Ny"))
-                    ni = int(ec.codes_get(gid, "Nx"))
-                if values.size != ni * nj:
-                    raise RuntimeError("GRIB2の格子点数と値の数が一致しません。")
-                return values.reshape(nj, ni), (lats.reshape(nj, ni), lons.reshape(nj, ni))
+                    nj = int(ec.codes_get(gid, "Nj"))
+                    values = np.asarray(ec.codes_get_array(gid, "values"), dtype=np.float32)
+                    if values.size != ni * nj:
+                        raise RuntimeError("GRIB2の格子点数が一致しません。")
+                    if not selected:
+                        lats = np.asarray(ec.codes_get_array(gid, "latitudes"), dtype=np.float32).reshape(nj, ni)
+                        lons = np.asarray(ec.codes_get_array(gid, "longitudes"), dtype=np.float32).reshape(nj, ni)
+                    selected[(name, step)] = values.reshape(nj, ni)
+                    if wanted.issubset(selected):
+                        break
+                except (KeyError, ValueError, TypeError):
+                    continue
             finally:
                 ec.codes_release(gid)
-    raise RuntimeError(
-        f"{pressure_level} hPaの{short_name}でFH{step}が見つかりません。"
-        f"このファイルに含まれる予報時間：{sorted(available)}"
-    )
+    _msm_diag(f"{pressure_level}hPa GRIB2走査完了 {scanned_messages}メッセージ / 抽出 {len(selected)}場")
+    for step in required_steps:
+        for name in ("u", "v"):
+            if (name, step) not in selected:
+                found = sorted(fh for n, fh in available if n == name)
+                raise RuntimeError(f"{pressure_level} hPaの{name}でFH{step}が見つかりません。収録FH：{found}")
+    return selected, lats, lons
 
 
-@st.cache_data(show_spinner=False, ttl=86400, max_entries=80)
-def fetch_msm_p_field(
-    target_date: date,
-    utc_hour: int,
-    pressure_level: int,
-    crater_latitude: float,
-    crater_longitude: float,
-):
-    """RISHのMSM-P GRIB2から元アプリと同じ単一時刻の風場を取得。
-
-    元のNetCDF実装は ds.sel(time=..., method="nearest") を使用していた。
-    今回も3時間ごとのMSM有効時刻から最も近い1時刻を選び、
-    時間内挿・過去数時間の積算・時変軌跡計算は一切行わない。
-    """
-    requested_utc = datetime.combine(target_date, time(hour=int(utc_hour)))
-    day_start = requested_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-    hours_since_midnight = (requested_utc - day_start).total_seconds() / 3600.0
-    # ちょうど中間なら過去側を優先（np.datetime64のnearestと同値の挙動は未規定）。
-    nearest_index = int(math.floor(hours_since_midnight / 3.0 + 0.5 - 1e-10))
-    valid_utc = day_start + timedelta(hours=3 * nearest_index)
-    cycle = valid_utc  # その有効時刻の初期値FH0を使う
-    url = msm_grib_url(cycle)
-    raw = download_msm_grib(cycle)
-
-    try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "msm.grib2"
-            path.write_bytes(raw)
-            u, (lat_grid, lon_grid) = _read_grib_component(
-                path, "u", 0, int(pressure_level)
-            )
-            v, (v_lat_grid, v_lon_grid) = _read_grib_component(
-                path, "v", 0, int(pressure_level)
-            )
-            if (u.shape != v.shape
-                    or not np.array_equal(lat_grid, v_lat_grid)
-                    or not np.array_equal(lon_grid, v_lon_grid)):
-                raise RuntimeError("MSM-Pのuとvの格子が一致しません。")
+def _read_grib_fields_levels(path: Path, pressure_levels: tuple):
+    """GRIB2を一度だけ走査して、指定した全気圧面のFH0をまとめて抽出する。"""
+    import eccodes as ec
+    levels = tuple(sorted(set(int(level) for level in pressure_levels)))
+    required = {(level, name) for level in levels for name in ("u", "v", "gh")}
+    selected = {}
+    grids = {}
+    scanned = 0
+    _msm_diag(f"{path.name} {levels}hPa 一括GRIB2走査開始")
+    _grib_memory_checkpoint("GRIB走査直前")
+    _grib_memory_checkpoint("一括GRIB走査直前")
+    ec.codes_grib_multi_support_on()
+    with path.open("rb") as fh:
+        while True:
+            gid = ec.codes_grib_new_from_file(fh)
+            if gid is None:
+                break
+            scanned += 1
             try:
-                height, (h_lat_grid, h_lon_grid) = _read_grib_component(
-                    path, "gh", 0, int(pressure_level)
-                )
-                if (height.shape != u.shape
-                        or not np.array_equal(lat_grid, h_lat_grid)
-                        or not np.array_equal(lon_grid, h_lon_grid)):
-                    height = None
-            except RuntimeError:
-                height = None
+                try:
+                    name = str(ec.codes_get(gid, "shortName"))
+                    if name not in ("u", "v", "gh"):
+                        continue
+                    kind = str(ec.codes_get(gid, "typeOfLevel"))
+                    if kind not in ("isobaricInhPa", "isobaricInPa"):
+                        continue
+                    level = float(ec.codes_get(gid, "level"))
+                    if kind == "isobaricInPa":
+                        level /= 100
+                    rounded = round(level)
+                    if abs(level - rounded) > 0.01 or rounded not in levels:
+                        continue
+                    step = float(ec.codes_get(gid, "endStep", ktype=float))
+                    unit = str(ec.codes_get(gid, "stepUnits"))
+                    if unit in ("m", "min"):
+                        step /= 60
+                    elif unit in ("s", "sec"):
+                        step /= 3600
+                    elif unit in ("d", "day"):
+                        step *= 24
+                    if abs(step) > 1e-6 or (rounded, name) in selected:
+                        continue
+                    ni = int(ec.codes_get(gid, "Ni"))
+                    nj = int(ec.codes_get(gid, "Nj"))
+                    values = np.asarray(ec.codes_get_array(gid, "values"), dtype=np.float32)
+                    if values.size != ni * nj:
+                        raise RuntimeError("GRIB2の格子点数が一致しません。")
+                    if rounded not in grids:
+                        lat = np.asarray(ec.codes_get_array(gid, "latitudes"), dtype=np.float32).reshape(nj, ni)
+                        lon = np.asarray(ec.codes_get_array(gid, "longitudes"), dtype=np.float32).reshape(nj, ni)
+                        grids[rounded] = (lat, lon)
+                    selected[(rounded, name)] = values.reshape(nj, ni)
+                    if required.issubset(selected):
+                        break
+                except (KeyError, ValueError, TypeError):
+                    continue
+            finally:
+                ec.codes_release(gid)
+            if scanned % 150 == 0:
+                _msm_diag(f"一括GRIB2走査 {scanned}メッセージ")
+    _grib_memory_checkpoint("一括GRIB走査直後・全GRIBハンドルrelease済", selected=selected)
+    _msm_diag(f"一括GRIB2走査完了 {scanned}メッセージ / {len(selected)}場")
+    for level in levels:
+        for name in ("u", "v"):
+            if (level, name) not in selected:
+                raise RuntimeError(f"{level}hPaのFH0 {name}が見つかりません。")
+    return selected, grids
+
+
+@lru_cache(maxsize=4)
+def _load_cycle_regions(cycle: datetime, pressure_levels: tuple,
+                        crater_latitude: float, crater_longitude: float):
+    """必要な全気圧面を一括抽出し、火口周辺の小配列のみキャッシュする。"""
+    _grib_memory_checkpoint("サイクル読み込み前")
+    path = download_msm_grib(cycle)
+    _grib_memory_checkpoint("GRIBダウンロード/再利用後")
+    # ecCodes decoding is isolated in a short-lived subprocess. Its native
+    # allocations are reclaimed by the OS when the worker exits.
+    import subprocess
+    worker_path = Path(__file__).resolve().with_name("grib_region_worker.py")
+    if not worker_path.is_file():
+        raise RuntimeError(f"GRIB2子プロセス用スクリプトがありません: {worker_path}")
+    with tempfile.TemporaryDirectory(prefix="msm_grib_region_") as temporary:
+        output = Path(temporary) / "regions.npz"
+        command = [sys.executable, str(worker_path),
+                   "--input", str(path), "--output", str(output),
+                   "--levels", ",".join(str(int(v)) for v in pressure_levels),
+                   "--lat", repr(float(crater_latitude)),
+                   "--lon", repr(float(crater_longitude))]
+        _msm_diag(f"{path.name} GRIB2子プロセス開始")
+        _grib_memory_checkpoint("GRIB子プロセス起動前")
+        try:
+            completed = subprocess.run(command, capture_output=True, text=True,
+                                       timeout=180, check=False)
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError("GRIB2子プロセスが180秒以内に完了しませんでした。") from error
+        if completed.returncode != 0:
+            raise RuntimeError("GRIB2子プロセスが失敗しました: " +
+                               (completed.stderr or completed.stdout)[-3000:])
+        _grib_memory_checkpoint("GRIB子プロセス終了後・親プロセス")
+        result = {}
+        with np.load(output, allow_pickle=False) as archive:
+            for level in pressure_levels:
+                lat_grid = archive[f"{level}_lat"].copy()
+                lon_grid = archive[f"{level}_lon"].copy()
+                small = {(name, 0): archive[f"{level}_{name}"].copy()
+                         for name in ("u", "v", "gh")
+                         if f"{level}_{name}" in archive.files}
+                x_grid, y_grid = local_xy_m(lat_grid, lon_grid,
+                                            crater_latitude, crater_longitude)
+                result[level] = (small, lat_grid, lon_grid, x_grid, y_grid)
+    _grib_memory_checkpoint("子プロセス領域配列受信後・親プロセス")
+    _msm_diag(f"{cycle:%m/%d %H}UTC {pressure_levels}hPa 領域切出し完了")
+    return result
+
+
+def _load_cycle_region(cycle: datetime, pressure_level: int,
+                       crater_latitude: float, crater_longitude: float):
+    levels = tuple(sorted(set(_MSM_ACTIVE_LEVELS.get()) | {int(pressure_level)}))
+    return _load_cycle_regions(cycle, levels, crater_latitude, crater_longitude)[pressure_level]
+
+
+def fetch_msm_p_field(target_date: date, utc_hour: int, pressure_level: int,
+                      crater_latitude: float, crater_longitude: float):
+    """前後の3時間毎のFH0（解析初期値）だけから正時風速場を線形内挿する。"""
+    valid_utc = datetime.combine(target_date, time(hour=int(utc_hour)))
+    cycle0, step = msm_cycle_and_step(valid_utc)
+    cycle1 = cycle0 + timedelta(hours=3) if step else None
+    try:
+        fields0, lat_grid, lon_grid, x_grid, y_grid = _load_cycle_region(
+            cycle0, pressure_level, crater_latitude, crater_longitude)
+        fields1 = None
+        if cycle1 is not None:
+            fields1, lat1, lon1, _, _ = _load_cycle_region(
+                cycle1, pressure_level, crater_latitude, crater_longitude)
+            if (lat_grid.shape != lat1.shape or lon_grid.shape != lon1.shape or
+                    not np.allclose(lat_grid, lat1, atol=1e-5, rtol=0) or
+                    not np.allclose(lon_grid, lon1, atol=1e-5, rtol=0)):
+                raise RuntimeError("前後のFH0の格子が一致しないため、時間内挿できません。")
     except (RuntimeError, OSError, ValueError) as error:
+        source = f"{cycle0:%Y-%m-%d %H}UTC"
+        if cycle1 is not None:
+            source += f"・{cycle1:%Y-%m-%d %H}UTC"
         raise RuntimeError(
-            f"MSM-P GRIB2読み込みに失敗：{valid_utc:%Y-%m-%d %H}UTC・"
-            f"{pressure_level}hPa（FH0）：{error}"
+            f"{valid_utc:%Y-%m-%d %H}UTC・{pressure_level}hPaの風速場取得に失敗。"
+            f"必要なFH0初期時刻：{source}：{error}"
         ) from error
 
-    # ecCodesの緯度・経度は2次元格子。元アプリと同じ火口周辺範囲に切り出す。
-    region = (
-        (lat_grid >= crater_latitude - 1.2)
-        & (lat_grid <= crater_latitude + 1.2)
-        & (lon_grid >= crater_longitude - 1.5)
-        & (lon_grid <= crater_longitude + 1.5)
-    )
-    if not np.any(region):
-        raise RuntimeError("火口周辺のMSM-P緯度経度格子を抽出できませんでした。")
-    rows, cols = np.where(region)
-    r0, r1 = int(rows.min()), int(rows.max()) + 1
-    c0, c1 = int(cols.min()), int(cols.max()) + 1
-    lat_grid = lat_grid[r0:r1, c0:c1]
-    lon_grid = lon_grid[r0:r1, c0:c1]
-    u = u[r0:r1, c0:c1]
-    v = v[r0:r1, c0:c1]
-    x_grid, y_grid = local_xy_m(
-        lat_grid, lon_grid, crater_latitude, crater_longitude
-    )
+    def field_value(name):
+        first = fields0.get((name, 0))
+        if first is None:
+            return None
+        if fields1 is None:
+            return first.copy()
+        second = fields1.get((name, 0))
+        if second is None:
+            return None
+        weight = step / 3.0
+        return ((1.0 - weight) * first + weight * second).astype(np.float32)
+
+    u, v, height = field_value("u"), field_value("v"), field_value("gh")
     valid = np.isfinite(u) & np.isfinite(v)
     if not np.any(valid):
-        raise RuntimeError("MSM-Pの風データがすべて欠測です。")
-
+        raise RuntimeError("MSMの風速データが欠測しています。")
     geopotential_height = None
     if height is not None:
-        cropped_height = height[r0:r1, c0:c1]
-        available = np.isfinite(cropped_height)
-        if np.any(available):
-            nearest = np.argmin(
-                np.where(available, x_grid ** 2 + y_grid ** 2, np.inf)
-            )
-            geopotential_height = float(cropped_height.ravel()[nearest])
+        closest = int(np.argmin(np.where(np.isfinite(height), x_grid**2 + y_grid**2, np.inf)))
+        value = float(height.ravel()[closest])
+        if np.isfinite(value):
+            geopotential_height = value
+    return {"lat_grid": lat_grid, "lon_grid": lon_grid,
+            "x_grid_m": x_grid, "y_grid_m": y_grid,
+            "u_ms": u, "v_ms": v, "valid": valid,
+            "analysis_time": valid_utc.strftime("%Y-%m-%d %H:%M UTC"),
+            "utc_hour": valid_utc.hour, "pressure_level": int(pressure_level),
+            "source_url": msm_grib_url(cycle0),
+            "source_urls": [msm_grib_url(cycle0)] + ([msm_grib_url(cycle1)] if cycle1 else []),
+            "forecast_cycle_utc": cycle0.strftime("%Y-%m-%d %H:%M UTC"),
+            "forecast_hour": 0,
+            "temporal_interpolation": ("linear_between_FH0_analyses" if step else "none"),
+            "source_forecast_hours": [0],
+            "source_analysis_times": [cycle0.strftime("%Y-%m-%d %H:%M UTC")] +
+                ([cycle1.strftime("%Y-%m-%d %H:%M UTC")] if cycle1 else []),
+            "geopotential_height_m": geopotential_height}
 
-    return {
-        "lat_grid": lat_grid,
-        "lon_grid": lon_grid,
-        "x_grid_m": x_grid,
-        "y_grid_m": y_grid,
-        "u_ms": u,
-        "v_ms": v,
-        "valid": valid,
-        "analysis_time": valid_utc.strftime("%Y-%m-%d %H:%M UTC"),
-        "utc_hour": valid_utc.hour,
-        "pressure_level": int(pressure_level),
-        "source_url": url,
-        "forecast_cycle_utc": cycle.strftime("%Y-%m-%d %H:%M UTC"),
-        "forecast_hour": 0,
-        "geopotential_height_m": geopotential_height,
-    }
+
+
+# 正時風速場のStreamlitキャッシュは通常設定に復帰。
+# メモリ診断は計算式やキャッシュ条件を変更しない。
+MSM_HOURLY_STREAMLIT_CACHE_ENABLED = True
+if MSM_HOURLY_STREAMLIT_CACHE_ENABLED:
+    fetch_msm_p_field = st.cache_data(
+        show_spinner=False, ttl=3600, max_entries=12
+    )(fetch_msm_p_field)
+
+
+def build_time_varying_msm_field(end_utc: datetime, pressure_level: int,
+                                  crater_latitude: float, crater_longitude: float):
+    """各正時の風を前後30分に適用。計算期間に必要な風速場を収集する。"""
+    start_utc = end_utc - timedelta(hours=MODEL_LOOKBACK_HOURS)
+    first_valid = start_utc.replace(minute=0, second=0, microsecond=0)
+    fields = []
+    _grib_memory_checkpoint("風速場構築前")
+    _msm_diag(f"{pressure_level}hPa 過去{MODEL_LOOKBACK_HOURS}時間の風速場構築開始")
+    for hour_offset in range(MODEL_LOOKBACK_HOURS + 1):
+        valid_time = first_valid + timedelta(hours=hour_offset)
+        _msm_diag(f"{pressure_level}hPa {valid_time:%m/%d %H}UTC 風速場取得開始 ({hour_offset+1}/{MODEL_LOOKBACK_HOURS+1})")
+        field = fetch_msm_p_field(valid_time.date(), valid_time.hour,
+                    pressure_level, crater_latitude, crater_longitude)
+        fields.append({"valid_time": valid_time, "field": field})
+        _msm_diag(f"{pressure_level}hPa {valid_time:%m/%d %H}UTC 風速場取得完了 ({hour_offset+1}/{MODEL_LOOKBACK_HOURS+1})")
+    # 終了時刻の風を代表値とし、既存の表示項目・手動フィッティングとの互換性を維持。
+    _grib_memory_checkpoint("風速場構築後")
+    _msm_diag(f"{pressure_level}hPa 過去5時間の風速場構築完了")
+    result = dict(fields[-1]["field"])
+    result["time_slices"] = fields
+    result["model_start_utc"] = start_utc
+    result["model_end_utc"] = end_utc
+    result["wind_application"] = "毎正時の風を前後30分に適用"
+    return result
+
+
+def wind_field_at(msm_field: dict, instant: datetime):
+    """各正時の前後30分に風速場を割り当てる。"""
+    slices = msm_field.get("time_slices")
+    if not slices:
+        return msm_field
+    midpoints = [item["valid_time"] + timedelta(minutes=30) for item in slices]
+    index = bisect_right(midpoints, instant)
+    return slices[min(index, len(slices) - 1)]["field"]
 
 
 def interpolate_idw_wind(msm_field, x_m: float, y_m: float, radius_m: float = 10_000.0):
@@ -1026,12 +1260,66 @@ def interpolate_idw_wind(msm_field, x_m: float, y_m: float, radius_m: float = 10
     return u, v
 
 
+def calculate_time_varying_axis(msm_field, maximum_distance_km: float):
+    """各放出時刻の気塊を終了時刻まで追跡し、時変風速場のプルーム主軸を生成。"""
+    start = msm_field["model_start_utc"]
+    end = msm_field["model_end_utc"]
+    dt = timedelta(minutes=MODEL_TIME_STEP_MINUTES)
+    release_times = []
+    t = end - dt
+    while t >= start:
+        release_times.append(t)
+        t -= dt
+    xs, ys, distances, speeds = [0.0], [0.0], [0.0], []
+    u0, v0 = interpolate_idw_wind(wind_field_at(msm_field, end), 0.0, 0.0)
+    speed0 = math.hypot(u0, v0)
+    if speed0 < 0.2:
+        raise RuntimeError("終了時刻の火口上空風速が小さすぎます。")
+    speeds.append(speed0)
+    for released in release_times:
+        x = y = travelled = 0.0
+        current = released
+        while current < end:
+            mid = current + dt / 2
+            field = wind_field_at(msm_field, mid)
+            u, v = interpolate_idw_wind(field, x, y)
+            seconds = min((end - current).total_seconds(), dt.total_seconds())
+            x += u * seconds
+            y += v * seconds
+            travelled += math.hypot(u, v) * seconds
+            current += timedelta(seconds=seconds)
+        if travelled > maximum_distance_km * 1000.0:
+            continue
+        xs.append(x)
+        ys.append(y)
+        distances.append(travelled)
+        final_u, final_v = interpolate_idw_wind(wind_field_at(msm_field, end), x, y)
+        speeds.append(max(math.hypot(final_u, final_v), 0.1))
+    if len(xs) < 3:
+        raise RuntimeError("時間変化する風速場から十分な主軸を計算できません。")
+    # 距離順に並べ、KDTree・ピーク探索との既存インターフェースを維持。
+    order = np.argsort(distances)
+    xs = np.asarray(xs)[order]
+    ys = np.asarray(ys)[order]
+    distances = np.asarray(distances)[order]
+    speeds = np.asarray(speeds)[order]
+    wind_from = (270.0 - math.degrees(math.atan2(v0, u0))) % 360.0
+    return {"x_m": xs, "y_m": ys, "distance_m": distances,
+            "speed_ms": speeds, "delta_t_s": dt.total_seconds(),
+            "crater_u_ms": float(u0), "crater_v_ms": float(v0),
+            "crater_speed_ms": float(speed0),
+            "crater_wind_from_deg": wind_from,
+            "crater_transport_to_deg": (wind_from + 180.0) % 360.0}
+
+
 def calculate_main_axis(
     msm_field,
     maximum_distance_km: float,
     nominal_step_m: float = 100.0,
 ):
     """式(1)～(7)に基づき、MSM-P固定時刻の風場から主軸を計算する。"""
+    if msm_field.get("time_slices"):
+        return calculate_time_varying_axis(msm_field, maximum_distance_km)
     u0, v0 = interpolate_idw_wind(msm_field, 0.0, 0.0)
     speed0 = math.hypot(u0, v0)
     if speed0 < 0.2:
@@ -1669,7 +1957,7 @@ def create_so2_map_export_png(
                         f"{zoom}/{tile_x}/{tile_y}.png"
                     ),
                     headers=headers,
-                    timeout=20,
+                    timeout=(3, 5),
                 )
                 response.raise_for_status()
                 tile = Image.open(
@@ -2056,6 +2344,7 @@ st.set_page_config(
 require_app_password()
 st.title("TROPOMI SO₂ 表示ビューア")
 st.caption("TROPOMI SO₂ + 京都大学生存圏研究所 MSM-P / 準定常ガス拡散モデル")
+st.caption("注：RISHのMSM-P気圧面GRIB2は3時間間隔（FH0, 3, 6…）です。毎正時の風は、その前後の3時間値から線形内挿して作成します。")
 
 try:
     volcanoes = load_volcanoes()
@@ -2147,17 +2436,6 @@ with st.sidebar:
         format_func=lambda value: f"{value} × {value}",
     )
 
-    use_connected_plume_detection = st.checkbox(
-        "連結数でプルーム判定する",
-        value=False,
-        help=(
-            "OFF：10～30 km内の判定格子で0.001 mol/m²以上の"
-            "ピークがあれば採用します。"
-            "ON：閾値以上の画素が8近傍で3個以上連結する場合だけ"
-            "プルームとして採用します。"
-        ),
-    )
-
     crater_lat = float(crater_lat)
     crater_lon = float(crater_lon)
 
@@ -2236,12 +2514,12 @@ with st.sidebar:
 
     selected_jst_hours = st.multiselect(
         "計算時刻（JST）",
-        options=list(range(0, 24, 3)),
-        default=[12, 15],
+        options=[13, 14],
+        default=[13, 14],
         format_func=lambda value: f"{value:02d}:00 JST",
         help=(
             "選択した時刻と気圧面の全組合せを計算します。"
-            "MSM-Pは3時間間隔で、最も近い時刻の風場を固定して計算します。"
+            "各正時の風を前後30分間に適用し、終了時刻まで過去5時間を計算します。"
         ),
         disabled=not run_model_calculation,
     )
@@ -2366,10 +2644,28 @@ if run:
         with st.spinner(
             "SO₂画像・数値データ・雲量を取得しています…"
         ):
+            progress_status = st.empty()
+            progress_start = time_module.monotonic()
+
+            def report_progress(message):
+                elapsed = time_module.monotonic() - progress_start
+                progress_status.info(f"TROPOMI取得: {message}（経過 {elapsed:.1f} 秒）")
+                print(f"[TROPOMI] {elapsed:.1f}s {message}", flush=True)
+
+            # 解析開始時のRSSとキャッシュ利用状況を記録する。
+            # モデル計算・データ取得・キャッシュの保持条件には影響しない。
+            _msm_diag_callback_token = _MSM_DIAGNOSTIC.set(report_progress)
+            if not tracemalloc.is_tracing():
+                tracemalloc.start(5)
+            _grib_memory_checkpoint("解析開始")
+            _msm_cache_diagnostic("解析開始")
+            _memory_ownership_diagnostic("解析開始")
+            report_progress("CDSE認証中")
             token = get_access_token(
                 client_id,
                 client_secret,
             )
+            report_progress("CDSE認証完了・SO₂画像取得中 (1/5)")
 
             so2_png = request_process(
                 token=token,
@@ -2381,6 +2677,7 @@ if run:
                 mime_type="image/png",
             )
 
+            report_progress("SO₂画像取得完了・SO₂数値取得中 (2/5)")
             # 表示・クリック値取得用の高解像度格子。
             so2_tiff = request_process(
                 token=token,
@@ -2392,7 +2689,8 @@ if run:
                 mime_type="image/tiff",
             )
 
-            # 連結判定は表示用768×768等では行わない。
+            report_progress("SO₂数値取得完了・ピーク判定格子取得中 (3/5)")
+            # ピーク検索は表示用768×768等では行わず、従来の粗い格子を使用。
             # 約5.5 km（南北）×3.5 km（東西）のTROPOMI相当格子を
             # 別途取得し、元画素相当のピクセル数を数える。
             detection_width, detection_height = plume_detection_grid_size(
@@ -2412,6 +2710,7 @@ if run:
                 mime_type="image/tiff",
             )
 
+            report_progress("ピーク判定格子取得完了・雲量画像取得中 (4/5)")
             cloud_png = request_process(
                 token=token,
                 bbox=bbox,
@@ -2422,6 +2721,7 @@ if run:
                 mime_type="image/png",
             )
 
+            report_progress("雲量画像取得完了・雲量数値取得中 (5/5)")
             cloud_tiff = request_process(
                 token=token,
                 bbox=bbox,
@@ -2432,20 +2732,17 @@ if run:
                 mime_type="image/tiff",
             )
 
+            report_progress("全データ取得完了・GeoTIFF展開中")
             so2_array, so2_transform = read_float_tiff(so2_tiff)
             plume_detection_array, plume_detection_transform = read_float_tiff(
                 plume_detection_tiff
             )
             cloud_array, cloud_transform = read_float_tiff(cloud_tiff)
+            report_progress("GeoTIFF展開完了・解析処理中")
             if cloud_array.shape != so2_array.shape:
                 raise RuntimeError("SO₂と雲量の格子形状が一致しません。")
 
-            minimum_connected_pixels = (
-                MIN_CONNECTED_PLUME_PIXELS
-                if use_connected_plume_detection
-                else 1
-            )
-
+            report_progress("10～30 kmの最大濃度検索中")
             maximum = find_annulus_maximum(
                 array=plume_detection_array,
                 transform=plume_detection_transform,
@@ -2454,24 +2751,19 @@ if run:
                 min_distance_km=10.0,
                 max_distance_km=30.0,
                 threshold_mol_m2=PLUME_THRESHOLD_MOL_M2,
-                min_connected_pixels=minimum_connected_pixels,
             )
+            report_progress("最大濃度検索完了")
             if maximum is not None:
                 maximum["detection_grid_width"] = int(detection_width)
                 maximum["detection_grid_height"] = int(detection_height)
                 maximum["detection_resolution_ns_km"] = 5.5
                 maximum["detection_resolution_ew_km"] = 3.5
 
-            so2_map_png, so2_map_tile_error = (
-                create_so2_map_export_png(
-                    so2_png=so2_png,
-                    bbox=bbox,
-                    crater_lat=crater_lat,
-                    crater_lon=crater_lon,
-                    maximum=maximum,
-                    zoom=8,
-                )
-            )
+            # 背景地図タイルの逐次HTTP取得は数分以上ブロックし得るため、
+            # データ取得・モデル計算の経路から除外。保存要求時のみ生成する。
+            so2_map_png, so2_map_tile_error = None, None
+            report_progress("ピーク解析完了・モデル計算へ")
+            _MSM_DIAGNOSTIC.set(report_progress)
 
             tropomi_resolution = {
                 "ns_km": float(model_resolution_ns_km),
@@ -2495,6 +2787,9 @@ if run:
                 # 自動ピークの有無にかかわらずMSM-P風場は取得する。
                 # これにより、自動検出失敗時でも後から任意地点で
                 # 手動フィッティングできる。
+                # 同一GRIB2ファイルは選択気圧面をまとめて一度だけ走査する。
+                _MSM_ACTIVE_LEVELS.set(tuple(sorted(set(int(p) for p in selected_pressure_levels))))
+                report_progress(f"MSM-P候補計算開始（{len(selected_jst_hours)}時刻 × {len(selected_pressure_levels)}気圧面）")
                 for jst_hour in sorted(selected_jst_hours):
                     # 選択日JSTからUTC日時へ変換する。
                     jst_datetime = datetime.combine(
@@ -2510,14 +2805,13 @@ if run:
                         reverse=True,
                     ):
                         try:
-                            candidate_field = fetch_msm_p_field(
-                                msm_date_utc,
-                                msm_hour_utc,
-                                pressure_level,
-                                crater_lat,
-                                crater_lon,
+                            report_progress(f"MSM-P {jst_hour:02d} JST / {pressure_level}hPa 取得開始")
+                            candidate_field = build_time_varying_msm_field(
+                                utc_datetime, pressure_level,
+                                crater_lat, crater_lon,
                             )
 
+                            report_progress(f"MSM-P {jst_hour:02d} JST / {pressure_level}hPa 取得完了")
                             candidate_emission_height_m = float(
                                 manual_emission_height_m
                             )
@@ -2557,6 +2851,7 @@ if run:
 
                             # 自動ピークが存在する場合だけ、自動モデル計算を行う。
                             if maximum is not None:
+                                report_progress(f"モデル計算開始 {jst_hour:02d} JST / {pressure_level}hPa")
                                 candidate_result = calculate_quasi_steady_model(
                                     msm_field=candidate_field,
                                     crater_latitude=crater_lat,
@@ -2575,12 +2870,14 @@ if run:
                                     target_ns_km=float(model_resolution_ns_km),
                                     target_ew_km=float(model_resolution_ew_km),
                                 )
+                                report_progress(f"モデル濃度場計算完了 {jst_hour:02d} JST / {pressure_level}hPa・フィッティング中")
                                 candidate_result = add_peak_fitting_diagnostics(
                                     candidate_result,
                                     maximum,
                                     emission_rate_t_day,
                                 )
 
+                                report_progress(f"モデル候補完了 {jst_hour:02d} JST / {pressure_level}hPa")
                                 model_candidates.append(
                                     {
                                         **field_candidate,
@@ -2588,6 +2885,7 @@ if run:
                                     }
                                 )
                         except Exception as error:
+                            report_progress(f"候補エラー {jst_hour:02d} JST / {pressure_level}hPa: {type(error).__name__}: {str(error)[:180]}")
                             model_candidate_errors.append(
                                 {
                                     "jst_hour": int(jst_hour),
@@ -2612,6 +2910,7 @@ if run:
                             "MSM-P風場の取得にも失敗しました。"
                         )
                 elif model_candidates:
+                    report_progress("全候補計算完了・最適候補選択中")
                     optimal_candidate, optimal_selection_reason = (
                         choose_optimal_candidate(model_candidates)
                     )
@@ -2630,6 +2929,11 @@ if run:
                         "モデル計算に失敗しました。"
                     )
 
+        _grib_memory_checkpoint("モデル処理終了")
+        _msm_cache_diagnostic("モデル処理終了")
+        _memory_ownership_diagnostic("モデル処理終了")
+        _MSM_DIAGNOSTIC.set(None)
+        report_progress("解析完了・表示用データを保存中")
         st.session_state["viewer"] = {
             "so2_png": so2_png,
             "so2_map_png": so2_map_png,
@@ -2644,9 +2948,6 @@ if run:
             "model_result": model_result,
             "model_error": model_error,
             "run_model_calculation": run_model_calculation,
-            "use_connected_plume_detection": (
-                use_connected_plume_detection
-            ),
             "msm_field": msm_field,
             "model_candidates": model_candidates,
             "msm_candidates": msm_candidates,
@@ -2676,6 +2977,12 @@ if run:
             "volcano_name": volcano_name,
             "zoom": 8,
         }
+        _MSM_DIAGNOSTIC.set(report_progress)
+        _grib_memory_checkpoint("解析終了・表示データ保存後")
+        _msm_cache_diagnostic("解析終了・表示データ保存後")
+        _memory_ownership_diagnostic("解析終了・表示データ保存後")
+        _MSM_DIAGNOSTIC.reset(_msm_diag_callback_token)
+        report_progress("完了")
 
     except requests.Timeout:
         st.error(
@@ -2772,17 +3079,7 @@ else:
         maximum = data["maximum"]
 
         if maximum is None:
-            if data.get("use_connected_plume_detection", False):
-                st.warning(
-                    "10～30 km内で、0.001 mol/m²以上の画素が"
-                    "8近傍で3画素以上連結するプルームを"
-                    "検出できませんでした。"
-                )
-            else:
-                st.warning(
-                    "10～30 km内に0.001 mol/m²以上の"
-                    "SO₂ピークを検出できませんでした。"
-                )
+            st.warning("10～30 km内に0.001 mol/m²以上のSO₂ピークを検出できませんでした。")
         else:
             st.metric(
                 "SO₂カラム濃度",
@@ -2801,30 +3098,11 @@ else:
             st.write(
                 f"経度：{maximum['longitude']:.5f}°"
             )
-            if data.get("use_connected_plume_detection", False):
-                st.write(
-                    "連結ピクセル数："
-                    f"**{maximum['connected_pixel_count']}**"
-                )
-                st.write(
-                    "連結判定格子："
-                    f"**{maximum.get('detection_grid_width', '?')} × "
-                    f"{maximum.get('detection_grid_height', '?')}** "
-                    "（約3.5 km東西 × 5.5 km南北）"
-                )
-                st.caption(
-                    "約5.5 km×3.5 kmのTROPOMI相当格子で、"
-                    "0.001 mol/m²以上の画素が3画素以上、"
-                    "8近傍で連結した成分内の最大値です。"
-                    "地図上の黄色い★が最大値の位置です。"
-                )
-            else:
-                st.caption(
-                    "連結数判定はOFFです。約5.5 km×3.5 kmの判定格子で、"
-                    "10～30 km内の0.001 mol/m²以上の画素から"
-                    "最大値を採用しています。"
-                    "地図上の黄色い★が最大値の位置です。"
-                )
+            st.caption(
+                "約5.5 km×3.5 kmの判定格子で、10～30 km内の"
+                "0.001 mol/m²以上の画素から最大値を採用しています。"
+                "連結画素数による判定は行いません。"
+            )
 
     st.divider()
 
@@ -2833,7 +3111,7 @@ else:
         "地図上の任意のTROPOMI画素をクリックし、"
         "その地点と任意のカラム濃度を使ってモデルを再計算します。"
         "手動フィッティングでは、0.001 mol/m²以上・10～30 km・"
-        "連結数などの自動検出条件は適用しません。"
+        "自動検出条件は適用しません。"
         "自動ピークを検出できなかった場合でも実行できます。"
         "自動計算結果は上書きされません。"
     )
@@ -3463,7 +3741,7 @@ else:
                 )
             )
         st.caption(
-            "ピークが0.001 mol/m²以上、連結3画素以上、"
+            "ピークが0.001 mol/m²以上、"
             "かつ流向差が45°以下の場合のみ放出率を算出します。"
             "推定放出率 ＝ 入力した仮定放出率 × "
             "（TROPOMIピークカラム濃度／モデルピークカラム濃度）。"
@@ -3477,25 +3755,35 @@ else:
             "このため、地表から無限高度までの全カラムでは排出高度は計算値に影響しません。"
         )
 
-    if data.get("so2_map_tile_error"):
-        st.caption(
-            "保存画像の背景地図タイルを一部取得できなかった可能性があります。"
-            "SO₂、火口、10 km円、30 km円は保存画像へ描画されています。"
-        )
-
     download_left, download_right = st.columns(2)
 
     with download_left:
-        st.download_button(
-            "SO₂表示画像を保存（地図・10/30 km円付きPNG）",
-            data=data["so2_map_png"],
-            file_name=(
-                f"tropomi_so2_"
-                f"{data['selected_date'].isoformat()}.png"
-            ),
-            mime="image/png",
-            use_container_width=True,
-        )
+        st.caption("背景地図付きPNGは、必要なときだけ生成します。")
+        if st.button("保存用の地図画像を生成", key="generate_export_map"):
+            with st.spinner("背景地図タイルを取得して画像を生成しています…"):
+                try:
+                    export_png, export_error = create_so2_map_export_png(
+                        so2_png=data["so2_png"],
+                        bbox=data["bbox"],
+                        crater_lat=data["crater_lat"],
+                        crater_lon=data["crater_lon"],
+                        maximum=data["maximum"],
+                        zoom=8,
+                    )
+                    st.session_state["viewer"]["so2_map_png"] = export_png
+                    st.session_state["viewer"]["so2_map_tile_error"] = export_error
+                except Exception as error:
+                    st.error(f"保存用画像の生成に失敗しました: {error}")
+        if data.get("so2_map_tile_error"):
+            st.warning("背景地図タイルの一部を取得できませんでした。")
+        if data.get("so2_map_png") is not None:
+            st.download_button(
+                "SO₂表示画像を保存（地図・10/30 km円付きPNG）",
+                data=data["so2_map_png"],
+                file_name=f"tropomi_so2_{data['selected_date'].isoformat()}.png",
+                mime="image/png",
+                use_container_width=True,
+            )
 
     with download_right:
         st.download_button(
@@ -3519,7 +3807,7 @@ with st.expander("表示・最大値・風データについて"):
 - 表示値はSentinel Hubで地図格子へ再サンプリングされた値です。
 - TROPOMI Level-2 NetCDFの元ピクセル値と完全に同一ではありません。
 - 準定常モデルの横方向拡散幅は論文式(11)の大気不安定条件を使用します。
-- MSM-Pは3時間間隔のため、選択時刻に最も近い有効時刻の風場（GRIB2のFH0）を固定して計算します。
+- MSMのGRIB2予報値を使用し、終了時刻から過去5時間の風速場を毎時30分に切り替えます。
 - モデルカラム濃度は式(8)の鉛直解析積分値です。
 - モデルは高解像度で内部計算した後、約5.5 km×3.5 kmのTROPOMI相当格子へ面積平均して表示します。
 - 放出率は1 t = 1,000 kgとして、t/day → kg/s → mol/sの順に変換します。
@@ -3531,7 +3819,7 @@ with st.expander("表示・最大値・風データについて"):
 - ピークフィッティング放出率は、入力放出率にTROPOMIピーク／モデルピークの比を乗じて算出します。
 - 地図で選択した任意地点と任意のカラム濃度を使い、取得済みのMSM-P風候補で追加フィッティングできます。
 - 自動ピークを検出できない場合でも、MSM-P風場の取得に成功していれば手動追加フィッティングを実行できます。
-- 手動追加フィッティングでは、0.001 mol/m²以上、10～30 km、連結ピクセル数などの自動ピーク検出条件を適用しません。
+- 手動追加フィッティングでは、0.001 mol/m²以上、10～30 km、自動ピーク検出条件を適用しません。
 - 手動追加フィッティングは自動結果を上書きせず、別枠の参考値として表示します。
 - 補正放出率はピークフィッティング放出率の3倍として表示します。
 - TROPOMIピーク流向とモデルピーク流向は、火口から各ピーク地点への方位角（北0°、東90°、南180°、西270°）です。
